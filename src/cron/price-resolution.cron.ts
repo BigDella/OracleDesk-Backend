@@ -54,6 +54,7 @@ export function startPriceResolutionCron(): void {
 
 /** Reveals any live price market whose resolver state is still Unconfigured. */
 async function revealPendingSpecs(): Promise<void> {
+  const now = new Date();
   const markets = await prisma.market.findMany({
     where: {
       status: 'ACTIVE',
@@ -65,8 +66,26 @@ async function revealPendingSpecs(): Promise<void> {
   for (const market of markets) {
     if (market.onChainMarketId === null) continue;
     try {
+      const step = await prisma.marketResolutionStep.findUnique({
+        where: { marketId_step: { marketId: market.id, step: 'PRICE_SPEC' } },
+      });
+      if (step && (step.status === 'LANDED' || step.status === 'LANDED_EXTERNALLY' || step.status === 'IN_FLIGHT')) {
+        continue;
+      }
+      if (step?.nextAttemptAt && step.nextAttemptAt > now) continue;
+
+      const inFlight = await prisma.chainTransaction.findFirst({
+        where: { kind: 'resolver.price_spec', refId: market.id, status: { in: ['PENDING', 'SIGNED', 'SUBMITTED'] } },
+        select: { id: true },
+      });
+      if (inFlight) continue;
+
       if ((await resolverState(market.onChainMarketId)).tag !== 'Unconfigured') continue;
-      await revealPriceSpec(market.onChainMarketId, market.resolutionSpec as Extract<ResolutionSpecJson, { kind: 'price' }>);
+      await revealPriceSpec(
+        market.onChainMarketId,
+        market.resolutionSpec as Extract<ResolutionSpecJson, { kind: 'price' }>,
+        { marketId: market.id },
+      );
     } catch (err) {
       logger.warn({ marketId: market.id, err }, 'Price resolution cron: reveal failed; will retry next tick');
     }

@@ -329,6 +329,7 @@ model Market {
   agentDecisions AgentDecision[]
   agentLogs      AgentLog[]
   creationAttempt MarketCreationAttempt?
+  resolutionSteps MarketResolutionStep[]
 
   @@index([status])
   @@index([category])
@@ -338,6 +339,34 @@ model Market {
   @@index([lastReconciledAt])
   @@index([resolutionSpec], type: Gin)
   @@map("markets")
+}
+
+/// Persisted per-market resolver step state for outbox-tracked writes (#297).
+model MarketResolutionStep {
+  id            String    @id @default(uuid())
+  marketId      String
+  /// PRICE_SPEC | RESOLVE_PRICE | SIGNER_SPEC | ATTEST | FINALIZE_SIGNERS
+  step          String
+  /// PENDING | IN_FLIGHT | LANDED | LANDED_EXTERNALLY | FAILED | ESCALATED
+  status        String    @default("PENDING")
+  attempts      Int       @default(0)
+  nextAttemptAt DateTime?
+  escalatedAt   DateTime?
+  txHash        String?
+  ledger        Int?
+  outcome       String?
+  failureCode   String?
+  /// AGENT | EXTERNAL
+  landedBy      String?
+  lastOutboxId  String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  market Market @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@unique([marketId, step])
+  @@index([step, status, nextAttemptAt])
+  @@map("market_resolution_steps")
 }
 
 // Background job for market generation process, tracking status and errors
