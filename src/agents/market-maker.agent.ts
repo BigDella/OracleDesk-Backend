@@ -15,6 +15,12 @@ import { seedPolicyRecord } from '../services/seed-policy.service';
 import { toDisplayUsdc } from '../lib/amounts';
 import { prisma } from '../lib/prisma';
 import { evidenceFromSignals, generateReasoningTrace } from '../services/reasoning.service';
+import {
+  assessCorroboration,
+  traceCorroboration,
+  uncorroboratedLogData,
+  type CorroborationAssessment,
+} from '../services/corroboration.service';
 import { createMarketOnChain, planMarketCreation } from '../services/market-chain.service';
 import { planPriceMarket } from '../services/price-resolution.service';
 import type { ResolutionSpecJson } from '../lib/resolution-spec';
@@ -189,6 +195,38 @@ export async function runMarketMakerCycle(
       }
     }
 
+    // Step 2d: cross-source corroboration (#228). The claim must be reported by
+    // independent publishers or backed by an authoritative source before it is
+    // reserved, persisted, pinned or seeded. `observe` logs and continues.
+    let corroboration: CorroborationAssessment | null = null;
+    if (config.CORROBORATION_MODE !== 'off') {
+      try {
+        corroboration = await assessCorroboration(proposal, groundingSignals, resolutionDetails);
+      } catch (err) {
+        // observe must not change behaviour; enforce fails closed.
+        logger.warn({ err, mode: config.CORROBORATION_MODE }, 'Market Maker Agent: corroboration check failed');
+        if (config.CORROBORATION_MODE === 'enforce') return null;
+      }
+    }
+    if (corroboration) {
+      const { verdict } = corroboration;
+      if (!verdict.ok) {
+        await writeAgentLog({
+          agentType: 'MARKET_MAKER',
+          level:     'WARN',
+          action:    'PROPOSAL_UNCORROBORATED',
+          data:      { mode: config.CORROBORATION_MODE, ...uncorroboratedLogData(verdict, groundingSignals) },
+        }).catch(() => {});
+        if (config.CORROBORATION_MODE === 'enforce') {
+          logger.info({ units: verdict.detail.units, domains: verdict.detail.domains }, 'Market Maker Agent: proposal uncorroborated — skipping');
+          return null;
+        }
+      }
+      logger.info({ kind: verdict.kind, units: verdict.detail.units, mode: config.CORROBORATION_MODE }, 'Market Maker Agent: corroboration verdict');
+    }
+
+    signal.throwIfAborted();
+
     // Step 3: Reserve the proposal atomically (replaces bare checkDuplicate).
     // This makes dedup + insert atomic across concurrent cycles/instances (#283).
     const reservation = await reserveProposal({
@@ -292,7 +330,7 @@ export async function runMarketMakerCycle(
           ...proposal,
           initial_yes_probability: decision.pAdj,
           minimum_liquidity_usdc:  toDisplayUsdc(decision.seedRaw),
-        }, proposalProvenance, resolutionDetails, tx);
+        }, proposalProvenance, resolutionDetails, tx, corroboration?.record as Record<string, unknown> | undefined);
         market = await tx.market.update({ where: { id: created.id }, data: { seedPolicy: seedPolicy as object } });
         await commitReservation(reservationId, market!.id, tx);
       });
@@ -325,19 +363,24 @@ export async function runMarketMakerCycle(
 
     signal.throwIfAborted();
 
-    // Step 7: Reasoning trace for the creation decision
+    // Step 7: Reasoning trace for the creation decision. Evidence is what the
+    // proposal cites (#73), each with its signal id and link (the top news
+    // items when it cited none we can resolve), plus the corroborating signals
+    // (#228), so retention keeps them and a reader can check them.
+    const cited = evidenceFromSignals(groundingSignals.length > 0 ? groundingSignals : signals.news.slice(0, 3));
+    const citedIds = new Set(cited.map((e) => e.signalId).filter(Boolean));
+    const evidence = [...cited, ...(corroboration?.evidence ?? []).filter((e) => !citedIds.has(e.signalId))];
     const { trace, tracePayload } = await generateReasoningTrace({
       marketId:            market.id,
       agentType:           'MARKET_MAKER',
       decisionType:        'MARKET_CREATION',
-      // The evidence the proposal cites (#73), each with its signal id and link;
-      // the top news items when it cited none we can resolve.
-      sourcesUsed:         evidenceFromSignals(groundingSignals.length > 0 ? groundingSignals : signals.news.slice(0, 3)),
+      sourcesUsed:         evidence,
       probabilityEstimate: proposal.initial_yes_probability,
       marketProbability:   decision.pAdj,
       edge:                proposal.initial_yes_probability - decision.pAdj,
       confidenceInterval:  proposal.confidence_interval,
       seedPolicy,
+      sourceWeightSet:     signals.weightSet,
     }, { purpose: priority === 'admin' ? 'admin_trace_hedge' : 'trace_hedge', priority }, {
       // Who proposed the market comes first in the trace's provenance (#66).
       upstreamProvenance: [proposalProvenance],
@@ -347,11 +390,12 @@ export async function runMarketMakerCycle(
 
     // Step 8: Queue the trace for pinning + publication to reasoning-registry.
     // The queue publishes it once the market is on-chain (#131). The payload is
-    // fixed now: re-pinning later with a new onChainMarketId would change traceHash.
+    // the validated document, unchanged (#227): the worker passes the on-chain
+    // market id to publish_trace, so it never needs to be in the pinned bytes.
     try {
       await enqueueTracePublication({
         traceId: trace.id,
-        payload: { ...tracePayload, onChainMarketId: onChainMarketId?.toString() ?? null },
+        payload: tracePayload,
         action: TRACE_ACTIONS.createMarket,
       });
     } catch (err) {

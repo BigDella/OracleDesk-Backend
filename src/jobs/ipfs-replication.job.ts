@@ -30,7 +30,8 @@ export interface ReplicationRunSummary {
   unrecoverable: string[];
 }
 
-const REPLICATION_LOCK_ID = 271_271;
+/** Advisory-lock key: one replication sweep at a time across replicas. */
+const REPLICATION_LOCK = 'oracledesk:ipfs_replication';
 
 export async function enumerateAnchoredCids(): Promise<string[]> {
   const cids = new Set<string>();
@@ -218,8 +219,8 @@ export async function runIpfsReplicationJob(
   if (deps.providers) {
     return execute();
   }
-  const locked = await withAdvisoryLock(REPLICATION_LOCK_ID, execute).catch(() => null);
-  return locked ?? { checked: 0, repaired: 0, failed: 0, unrecoverable: [] };
+  const locked = await withAdvisoryLock(REPLICATION_LOCK, execute).catch(() => null);
+  return locked?.acquired ? locked.value : { checked: 0, repaired: 0, failed: 0, unrecoverable: [] };
 }
 
 /** Replication counts by provider and state for `GET /admin/status` (#271). */

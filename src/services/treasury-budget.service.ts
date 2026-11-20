@@ -151,7 +151,11 @@ export async function marketExposureRaw(marketId: string, onChainMarketId: bigin
 
 // ─── Clamp ────────────────────────────────────────────────────────────────────
 
-export type SizingBinding = 'KELLY' | 'CORRELATION' | 'MAX_TRADE' | 'MAX_MARKET' | 'DAILY' | 'AVAILABLE';
+/**
+ * What set an order's size. 'IMPACT' (#225): the FPMM sizer's interior
+ * optimum, below every cap; 'KELLY': the 2.5% single-position cap.
+ */
+export type SizingBinding = 'KELLY' | 'IMPACT' | 'CORRELATION' | 'MAX_TRADE' | 'MAX_MARKET' | 'DAILY' | 'AVAILABLE';
 
 /** Smallest order worth sending: 1 USDC. */
 export const MIN_TRADE_RAW = 10_000_000n;
@@ -173,15 +177,15 @@ export function clampSize(
   b: TreasuryBudget,
   marketHeadroomRaw: bigint,
   safetyBps: number = config.TREASURY_HEADROOM_SAFETY_BPS,
-): { sizeRaw: bigint; binding: Exclude<SizingBinding, 'CORRELATION'> } {
-  const limits: Array<[Exclude<SizingBinding, 'KELLY' | 'CORRELATION'>, bigint]> = [
+): { sizeRaw: bigint; binding: Exclude<SizingBinding, 'CORRELATION' | 'IMPACT'> } {
+  const limits: Array<[Exclude<SizingBinding, 'KELLY' | 'CORRELATION' | 'IMPACT'>, bigint]> = [
     ['MAX_TRADE', b.maxTradeRaw],
     ['MAX_MARKET', withSafetyMargin(marketHeadroomRaw, safetyBps)],
     ['DAILY', withSafetyMargin(b.dailyRemainingRaw, safetyBps)],
     ['AVAILABLE', b.availableRaw],
   ];
   let sizeRaw = maxBig(0n, desiredRaw);
-  let binding: Exclude<SizingBinding, 'CORRELATION'> = 'KELLY';
+  let binding: Exclude<SizingBinding, 'CORRELATION' | 'IMPACT'> = 'KELLY';
   for (const [name, limit] of limits) {
     const cap = maxBig(0n, limit);
     if (cap < sizeRaw) {

@@ -4,6 +4,7 @@ import { sendSuccess, parsePagination, buildPaginationMeta } from '../utils/resp
 import {
   controlScopeSchema,
   createOperationSchema,
+  moneyAuditRunSchema,
   pauseAgentSchema,
   reconcileRunSchema,
   recordSchema,
@@ -12,6 +13,7 @@ import {
 } from '../validators/admin.validator';
 import { controlsOverview, pauseAgent, resumeAgent } from '../services/agent-controls.service';
 import { defaultDeps, runReconciliation } from '../services/market-reconciler.service';
+import { runMoneyAudit } from '../services/money-audit/run';
 import { v4 as uuidv4 } from 'uuid';
 import { prisma } from '../lib/prisma';
 import { AgentDecisionKind, AgentDecisionReason, AgentType, TraceAuditStatus } from '@prisma/client';
@@ -20,13 +22,14 @@ import { sendError } from '../utils/response.util';
 import { logger } from '../lib/logger';
 import { config } from '../config';
 import { secret } from '../config/secrets';
-import { health } from '../services/health.service';
+import { chainWritesStatus, health } from '../services/health.service';
 import { indexerStatus } from '../services/indexer.service';
 import { agentAddresses, agentSigner } from '../services/stellar/clients';
 import { effectiveMode, specCompatReport } from '../services/stellar/spec-compat';
 import { getFeeOracle } from '../services/stellar/fees';
 import { getLlmUsage } from '../lib/llm-budget';
 import { getCronStatus } from '../cron/registry';
+import { MAX_SILENCE_MINUTES, acknowledgeIncident, listIncidents, silenceIncident } from '../services/ops-alerts/incidents';
 import { getReplicationSummary } from '../jobs/ipfs-replication.job';
 import {
   ensureSigningKeyRegistered,
@@ -34,6 +37,7 @@ import {
   signingKeyStatus,
 } from '../services/agent-signing-key.service';
 import { AppError } from '../middlewares/error.middleware';
+import * as sourceWeights from '../services/source-weights.service';
 import {
   ADMIN_ROLES,
   grantAdminRole,
@@ -61,6 +65,8 @@ import {
   recordSubmitted,
   submitOperation,
 } from '../services/treasury-ops.service';
+import { outboxActionSchema, outboxIdSchema, outboxListQuerySchema } from '../validators/admin.validator';
+import { abandon, listOutbox, outboxDetail, recoverNow, rerunHandler } from '../services/outbox-admin.service';
 
 function actor(req: Request): string {
   if (!req.user) throw new AppError(401, 'UNAUTHORIZED', 'Authentication required');
@@ -325,6 +331,8 @@ export async function getSystemStatus(_req: Request, res: Response): Promise<voi
       agentPublicKey: agentSigner().publicKey ?? null,
       preflight: 'not_implemented',
     },
+    // Outbox backlog, handler streaks, signer/channel balances (#220). Public keys only.
+    chainWrites: await chainWritesStatus().catch(() => null),
     llm: {
       anthropicConfigured: secret('ANTHROPIC_API_KEY') !== '',
       geminiConfigured: secret('GEMINI_API_KEY') !== '',
@@ -375,6 +383,61 @@ export async function triggerReconciliationRun(req: Request, res: Response): Pro
     { ...defaultDeps, emit: io ? (e, p) => io.to('admins').emit(e, p) : undefined },
   ).catch((err) => logger.error({ err, runId }, 'Background reconciliation run failed'));
   sendSuccess(res, { runId, message: 'Reconciliation run scheduled' }, 202);
+}
+
+/** GET /admin/money-audit/runs?limit= — money-audit runs (#222), newest first. */
+export async function listMoneyAuditRuns(req: Request, res: Response): Promise<void> {
+  const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? '20'), 10) || 20));
+  sendSuccess(res, await prisma.moneyAuditRun.findMany({ orderBy: { startedAt: 'desc' }, take: limit }));
+}
+
+/** GET /admin/money-audit/runs/:id/findings?severity=&invariant=&page=&limit= */
+export async function listMoneyAuditFindings(req: Request, res: Response): Promise<void> {
+  const id = String(req.params.id);
+  const run = await prisma.moneyAuditRun.findUnique({ where: { id } });
+  if (!run) throw new AppError(404, 'RUN_NOT_FOUND', 'Money audit run not found');
+  const { page, limit, skip } = parsePagination(req.query as any);
+  const where = {
+    runId: id,
+    ...(typeof req.query.severity === 'string' && req.query.severity ? { severity: req.query.severity.toUpperCase() } : {}),
+    ...(typeof req.query.invariant === 'string' && req.query.invariant ? { invariant: req.query.invariant.toUpperCase() } : {}),
+  };
+  const [findings, total] = await Promise.all([
+    prisma.moneyAuditFinding.findMany({ where, orderBy: { createdAt: 'asc' }, skip, take: limit }),
+    prisma.moneyAuditFinding.count({ where }),
+  ]);
+  sendSuccess(res, { run, findings }, 200, buildPaginationMeta(page, limit, total) as any);
+}
+
+/**
+ * POST /admin/money-audit/run
+ * Starts an audit in the background (same advisory lock as the cron) and
+ * returns 202 with its id. A dry run reports but never repairs.
+ */
+export async function triggerMoneyAuditRun(req: Request, res: Response): Promise<void> {
+  const parsed = moneyAuditRunSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Invalid money audit request', parsed.error.flatten().fieldErrors as any);
+  }
+  const runId = uuidv4();
+  runMoneyAudit({ runId, dryRun: parsed.data.dryRun ?? false })
+    .catch((err) => logger.error({ err, runId }, 'Background money audit run failed'));
+  sendSuccess(res, { runId, message: 'Money audit run scheduled' }, 202);
+}
+
+/** POST /admin/money-audit/findings/:id/ack — later runs carry the ack by fingerprint and do not re-alert. */
+export async function ackMoneyAuditFinding(req: Request, res: Response): Promise<void> {
+  const id = String(req.params.id);
+  const finding = await prisma.moneyAuditFinding.findUnique({ where: { id } });
+  if (!finding) throw new AppError(404, 'FINDING_NOT_FOUND', 'Money audit finding not found');
+  if (finding.ackedAt) {
+    sendSuccess(res, finding);
+    return;
+  }
+  sendSuccess(res, await prisma.moneyAuditFinding.update({
+    where: { id },
+    data: { action: 'ACKED', ackedBy: actor(req), ackedAt: new Date() },
+  }));
 }
 
 /**
@@ -500,143 +563,52 @@ export async function voidDisputeTx(req: Request, res: Response): Promise<void> 
   sendSuccess(res, await buildGuardianTx(disputeId(req), 'guardian_void_market'));
 }
 
-function decisionQueryString(value: unknown, name: string): string | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== 'string' || value.length === 0 || value.length > 200) {
-    throw new AppError(400, 'VALIDATION_ERROR', `${name} must be a non-empty string of at most 200 characters`);
-  }
-  return value;
+// ─── Admin outbox console (#221) ─────────────────────────────────────────
+
+function outboxId(req: Request): string {
+  const parsed = outboxIdSchema.safeParse(String(req.params.id ?? ''));
+  if (!parsed.success) throw new AppError(400, 'VALIDATION_ERROR', 'id must be a chain transaction UUID');
+  return parsed.data;
 }
 
-function decisionQueryEnum<T extends string>(
-  value: unknown,
-  name: string,
-  allowed: readonly T[],
-): T | undefined {
-  const raw = decisionQueryString(value, name);
-  if (raw === undefined) return undefined;
-  if (!allowed.includes(raw as T)) {
-    throw new AppError(400, 'VALIDATION_ERROR', `${name} must be one of: ${allowed.join(', ')}`);
+function outboxReason(req: Request): string {
+  const parsed = outboxActionSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'reason is required (10-500 characters)', parsed.error.flatten().fieldErrors as any);
   }
-  return raw as T;
+  return parsed.data.reason;
 }
 
-/** GET /admin/agent-decisions: filter and paginate individual decisions. */
-export async function getAgentDecisions(req: Request, res: Response): Promise<void> {
-  const { page, limit, skip } = parsePagination(req.query as any);
-  const cycleId = decisionQueryString(req.query.cycleId, 'cycleId');
-  const marketId = decisionQueryString(req.query.marketId, 'marketId');
-  const agentType = decisionQueryEnum(req.query.agentType, 'agentType', Object.values(AgentType));
-  const kind = decisionQueryEnum(req.query.kind, 'kind', Object.values(AgentDecisionKind));
-  const reasonCode = decisionQueryEnum(req.query.reasonCode, 'reasonCode', Object.values(AgentDecisionReason));
-  const where = {
-    ...(cycleId ? { cycleId } : {}),
-    ...(marketId ? { marketId } : {}),
-    ...(agentType ? { agentType } : {}),
-    ...(kind ? { kind } : {}),
-    ...(reasonCode ? { reasonCode } : {}),
-  };
-  const [rows, total] = await Promise.all([
-    prisma.agentDecision.findMany({ where, skip, take: limit, orderBy: { createdAt: 'desc' } }),
-    prisma.agentDecision.count({ where }),
-  ]);
+/** GET /admin/chain/transactions — outbox rows, newest first, with filters. */
+export async function listChainTransactions(req: Request, res: Response): Promise<void> {
+  const parsed = outboxListQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Invalid outbox filter', parsed.error.flatten().fieldErrors as any);
+  }
+  const { page, limit } = parsePagination(req.query as any);
+  const { rows, total } = await listOutbox({ ...parsed.data, page, limit });
   sendSuccess(res, rows, 200, buildPaginationMeta(page, limit, total) as any);
 }
 
-/** GET /admin/agent-decisions/cycles: recent cycle funnels grouped by agent. */
-export async function getAgentDecisionCycles(req: Request, res: Response): Promise<void> {
-  const { page, limit, skip } = parsePagination(req.query as any);
-  const [cycles, totalRows] = await Promise.all([
-    prisma.agentDecision.groupBy({
-      by: ['cycleId'],
-      _count: { _all: true },
-      _min: { createdAt: true },
-      _max: { createdAt: true },
-      orderBy: [{ _max: { createdAt: 'desc' } }, { cycleId: 'desc' }],
-      skip,
-      take: limit,
-    }),
-    prisma.$queryRaw<Array<{ total: string }>>`
-      SELECT COUNT(DISTINCT "cycleId")::text AS total FROM "agent_decisions"
-    `,
-  ]);
-  const total = Number(totalRows[0]?.total);
-  if (!Number.isSafeInteger(total) || total < 0) {
-    throw new Error('Agent decision cycle count is outside the supported pagination range');
-  }
-  const agents = cycles.length === 0
-    ? []
-    : await prisma.agentDecision.groupBy({
-        by: ['cycleId', 'agentType'],
-        where: { cycleId: { in: cycles.map((cycle) => cycle.cycleId) } },
-        _count: { _all: true },
-      });
-  const agentsByCycle = new Map<string, Array<{ agentType: AgentType; count: number }>>();
-  for (const row of agents) {
-    const list = agentsByCycle.get(row.cycleId) ?? [];
-    list.push({ agentType: row.agentType, count: row._count._all });
-    agentsByCycle.set(row.cycleId, list);
-  }
-  sendSuccess(
-    res,
-    cycles.map((cycle) => ({ ...cycle, agents: agentsByCycle.get(cycle.cycleId) ?? [] })),
-    200,
-    buildPaginationMeta(page, limit, total) as any,
-  );
+/** GET /admin/chain/transactions/:id — decoded envelope, fee bumps, RPC status, linked rows. */
+export async function getChainTransaction(req: Request, res: Response): Promise<void> {
+  sendSuccess(res, await outboxDetail(outboxId(req)));
 }
 
-/** GET /admin/agent-decisions/cycles/:cycleId: per-cycle decision funnel. */
-export async function getAgentDecisionCycleFunnel(req: Request, res: Response): Promise<void> {
-  const cycleId = decisionQueryString(req.params.cycleId, 'cycleId');
-  if (!cycleId) throw new AppError(400, 'VALIDATION_ERROR', 'cycleId is required');
+/** POST /admin/chain/transactions/:id/recover — one recovery pass for this row now. */
+export async function recoverChainTransaction(req: Request, res: Response): Promise<void> {
+  const id = outboxId(req);
+  sendSuccess(res, await recoverNow(id, actor(req), outboxReason(req)));
+}
 
-  const rows = await prisma.agentDecision.findMany({
-    where: { cycleId },
-    select: {
-      agentType: true,
-      kind: true,
-      reasonCode: true,
-      marketId: true,
-      traceId: true,
-      tradeId: true,
-      createdAt: true,
-    },
-    orderBy: { createdAt: 'asc' },
-  });
-  const steps = new Map<string, {
-    agentType: AgentType;
-    kind: AgentDecisionKind;
-    reasonCode: AgentDecisionReason;
-    count: number;
-    marketIds: Set<string>;
-  }>();
-  const marketCounts = new Map<string, number>();
-  for (const row of rows) {
-    const key = `${row.agentType}:${row.kind}:${row.reasonCode}`;
-    const step = steps.get(key) ?? {
-      agentType: row.agentType,
-      kind: row.kind,
-      reasonCode: row.reasonCode,
-      count: 0,
-      marketIds: new Set<string>(),
-    };
-    step.count++;
-    if (row.marketId) {
-      step.marketIds.add(row.marketId);
-      marketCounts.set(row.marketId, (marketCounts.get(row.marketId) ?? 0) + 1);
-    }
-    steps.set(key, step);
-  }
+/** POST /admin/chain/transactions/:id/rerun-handler — terminal rows only. */
+export async function rerunChainTransactionHandler(req: Request, res: Response): Promise<void> {
+  const id = outboxId(req);
+  sendSuccess(res, await rerunHandler(id, actor(req), outboxReason(req)));
+}
 
-  sendSuccess(res, {
-    cycleId,
-    totalDecisions: rows.length,
-    linkedTraces: rows.filter((row) => row.traceId !== null).length,
-    linkedTrades: rows.filter((row) => row.tradeId !== null).length,
-    steps: [...steps.values()].map(({ marketIds, ...step }) => ({
-      ...step,
-      marketCount: marketIds.size,
-    })),
-    markets: [...marketCounts].map(([marketId, decisionCount]) => ({ marketId, decisionCount })),
-  });
+/** POST /admin/chain/transactions/:id/abandon — only when the envelope provably cannot land. */
+export async function abandonChainTransaction(req: Request, res: Response): Promise<void> {
+  const id = outboxId(req);
+  sendSuccess(res, await abandon(id, actor(req), outboxReason(req)));
 }

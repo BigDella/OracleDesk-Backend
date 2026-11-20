@@ -26,6 +26,7 @@ import sep7Router from './routes/sep7.routes';
 import { createHealthRouter } from './routes/health.routes';
 import { health } from './services/health.service';
 import { isAllowedOrigin, socketMetrics } from './lib/socket-limits';
+import { captureRawBody } from './middlewares/service-auth.middleware';
 
 const app = express();
 
@@ -88,10 +89,14 @@ app.use(globalLimiter);
 
 // ─── Body Parsing + Compression ───
 app.use(compression());
-app.use(express.json({ limit: '1mb' }));
+// #219: keeps raw bytes for HMAC-signed service routes (captureRawBody).
+app.use(express.json({ limit: '1mb', verify: captureRawBody }));
 // Stream-based body parsing can resume handlers outside the request's async
 // context; re-enter it so everything downstream stays correlated.
-app.use((_req, res, next) => runInContext(res.locals.requestContext, next));
+app.use((_req, res, next) => {
+  const ctx = res.locals.requestContext;
+  return ctx ? runInContext(ctx, next) : next();
+});
 
 // ─── HTTP Logging ───
 // Paths only: the route template, never the query string or referrer.

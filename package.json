@@ -27,9 +27,11 @@
     "db:reset": "prisma migrate reset --force --skip-seed && npm run db:seed",
     "snapshot:export": "tsx scripts/snapshot-export.ts",
     "reconcile:post-restore": "tsx scripts/post-restore-reconcile.ts",
+    "backfill:payment-raw": "tsx scripts/backfill-payment-raw.ts",
     "gen:schemas": "tsx scripts/gen-schemas.ts",
     "check:schemas": "tsx scripts/gen-schemas.ts --check",
-    "check:config": "tsx scripts/check-config-usage.ts"
+    "check:config": "tsx scripts/check-config-usage.ts",
+    "weights:estimate": "tsx scripts/estimate-source-weights.ts"
   },
   "keywords": [],
   "author": "",

@@ -9,6 +9,10 @@ interface TableRule {
   columns: Record<string, Rule>;
 }
 
+/**
+ * Exported columns per model. Money is exported as exact base-unit columns
+ * only (#224); the Float mirrors are never selected.
+ */
 export const RULES: Record<string, TableRule> = {
   user: {
     output: 'users',
@@ -100,14 +104,14 @@ export const RULES: Record<string, TableRule> = {
   subscription: {
     output: 'subscriptions',
     columns: {
-      id: 'keep', userId: 'keep', traceId: 'keep', type: 'keep', status: 'keep', amountPaid: 'keep',
+      id: 'keep', userId: 'keep', traceId: 'keep', type: 'keep', status: 'keep', amountPaidRaw: 'keep',
       currency: 'keep', txHash: 'hash', expiresAt: 'keep', createdAt: 'keep', updatedAt: 'keep',
     },
   },
   paymentEvent: {
     output: 'payment_events',
     columns: {
-      id: 'keep', userId: 'keep', txHash: 'hash', type: 'keep', amount: 'keep', amountRaw: 'keep',
+      id: 'keep', userId: 'keep', txHash: 'hash', type: 'keep', amountRaw: 'keep',
       fromAddress: 'wallet', currency: 'keep', status: 'keep', traceId: 'keep', metadata: 'address-map',
       createdAt: 'keep', confirmedAt: 'keep',
     },
@@ -115,7 +119,7 @@ export const RULES: Record<string, TableRule> = {
   spendingAllowance: {
     output: 'spending_allowances',
     columns: {
-      id: 'keep', userId: 'keep', dailyLimit: 'keep', perTraceLimit: 'keep', spentToday: 'keep',
+      id: 'keep', userId: 'keep', dailyLimitRaw: 'keep', perTraceLimitRaw: 'keep', spentTodayRaw: 'keep',
       currency: 'keep', lastResetAt: 'keep', isActive: 'keep', createdAt: 'keep', updatedAt: 'keep',
     },
   },
@@ -150,6 +154,13 @@ export const RULES: Record<string, TableRule> = {
 export const EXCLUDED_TABLES = ['signal_cache'] as const;
 
 export class SnapshotExportError extends Error {}
+
+/** Prisma `select` for a model: only the columns its rule classifies. */
+export function selectFor(table: string): Record<string, true> {
+  const rule = RULES[table];
+  if (!rule) throw new SnapshotExportError(`No snapshot rule for table ${table}`);
+  return Object.fromEntries(Object.keys(rule.columns).map((column) => [column, true]));
+}
 
 export function jsonSafe(value: unknown): string {
   return JSON.stringify(value, (_key, item) => (typeof item === 'bigint' ? item.toString() : item));

@@ -14,6 +14,7 @@
  * unknown stays SUBMITTED and blocks new exits for that position until the
  * next call reconciles it against the on-chain balance, so it never sells twice.
  */
+import type { Prisma } from '@prisma/client';
 import { nowMs } from '../lib/clock';
 import { config } from '../config';
 import { prisma } from '../lib/prisma';
@@ -217,27 +218,34 @@ async function recordFailure(
  * with the position update, so the trade.sell completion handler (inline or
  * crash recovery) and exitPosition's direct path can both call it safely —
  * whoever wins the CAS applies the position deltas, the loser reads back.
+ *
+ * The deltas are computed from the position as read inside that transaction
+ * under FOR UPDATE, not from the caller's earlier read: two exits of one
+ * position confirmed at once (two recoverers, #229) would otherwise both start
+ * from the same sharesBefore and the second update would undo the first.
  */
 async function applyConfirmedExit(
   position: LoadedPosition,
   exitId: string,
   p: { sold: bigint; collateralOut: bigint; txHash: string | null; reason: string; note?: string },
 ): Promise<{ closed: boolean; applied: boolean }> {
-  const sharesBefore = decimalToBigint(position.sharesRaw);
-  const costBasisRaw = position.costBasisRaw ?? position.trade?.collateralRaw ?? position.trade?.amountRaw;
-  if (costBasisRaw == null) {
-    throw new AppError(409, 'POSITION_ACCOUNTING_RAW_MISSING', 'Position has no exact collateral cost basis');
-  }
-  const costBefore = decimalToBigint(costBasisRaw);
-  const sold = p.sold > sharesBefore ? sharesBefore : p.sold;
-  const remaining = sharesBefore - sold;
-  const closed = remaining <= DUST_SHARES;
-  const costSold = closed || sharesBefore === 0n ? costBefore : (costBefore * sold) / sharesBefore;
-  const realisedPnlRaw = decimalToBigint(position.realisedPnlRaw) + (p.collateralOut - costSold);
-  const effectivePriceBps = priceBpsFromRaw(p.collateralOut, sold);
-  const effectivePrice = effectivePriceBps === null ? null : effectivePriceBps / 10_000;
+  const result = await prisma.$transaction(async (tx) => {
+    const [current] = await tx.$queryRaw<
+      Array<{ sharesRaw: Prisma.Decimal | null; costBasisRaw: Prisma.Decimal | null; realisedCollateralRaw: Prisma.Decimal; realisedPnlRaw: Prisma.Decimal }>
+    >`SELECT "sharesRaw", "costBasisRaw", "realisedCollateralRaw", "realisedPnlRaw" FROM positions WHERE id = ${position.id} FOR UPDATE`;
+    if (!current) return null;
 
-  const applied = await prisma.$transaction(async (tx) => {
+    const sharesBefore = decimalToBigint(current.sharesRaw as never);
+    const costBefore = current.costBasisRaw == null
+      ? usdcFromNumber(position.trade?.amount ?? position.size)
+      : decimalToBigint(current.costBasisRaw);
+    const sold = p.sold > sharesBefore ? sharesBefore : p.sold;
+    const remaining = sharesBefore - sold;
+    const closed = remaining <= DUST_SHARES;
+    const costSold = closed || sharesBefore === 0n ? costBefore : (costBefore * sold) / sharesBefore;
+    const realisedPnlRaw = decimalToBigint(current.realisedPnlRaw) + (p.collateralOut - costSold);
+    const effectivePrice = sold > 0n ? Math.min(1, Number(p.collateralOut) / Number(sold)) : null;
+
     const won = await tx.positionExit.updateMany({
       where: { id: exitId, status: 'SUBMITTED' },
       data: {
@@ -250,13 +258,13 @@ async function applyConfirmedExit(
         error: p.note ?? null,
       },
     });
-    if (won.count === 0) return false;
+    if (won.count === 0) return null;
     await tx.position.update({
       where: { id: position.id },
       data: {
         sharesRaw: bigintToDecimalString(remaining),
         costBasisRaw: bigintToDecimalString(costBefore - costSold),
-        realisedCollateralRaw: bigintToDecimalString(decimalToBigint(position.realisedCollateralRaw) + p.collateralOut),
+        realisedCollateralRaw: bigintToDecimalString(decimalToBigint(current.realisedCollateralRaw) + p.collateralOut),
         realisedPnlRaw: bigintToDecimalString(realisedPnlRaw),
         pnl: toDisplayUsdc(realisedPnlRaw),
         ...(closed
@@ -274,13 +282,13 @@ async function applyConfirmedExit(
           : {}),
       } as any,
     });
-    return true;
+    return { closed };
   });
-  if (!applied) {
+  if (!result) {
     const current = await prisma.position.findUnique({ where: { id: position.id }, select: { status: true } });
     return { closed: current != null && current.status !== 'OPEN', applied: false };
   }
-  return { closed, applied: true };
+  return { closed: result.closed, applied: true };
 }
 
 /** Fills missing raw position accounting only from exact fills or chain balances. */

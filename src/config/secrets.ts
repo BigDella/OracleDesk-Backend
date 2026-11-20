@@ -28,6 +28,7 @@ export const SECRET_NAMES = [
   'ENTITLEMENT_SIGNING_KEY',
   'URI_REQUEST_SIGNING_SECRET',
   'TRACE_SIGNING_KEY',
+  'X402_ALLOWANCE_HMAC_SECRET',
   'DATABASE_URL',
 ] as const;
 
@@ -72,6 +73,7 @@ interface ResolvedSecrets {
   ENTITLEMENT_SIGNING_KEY: string;
   URI_REQUEST_SIGNING_SECRET?: string;
   TRACE_SIGNING_KEY?: string;
+  X402_ALLOWANCE_HMAC_SECRET?: string;
   DATABASE_URL: string;
   AGENT_SECRET_KEY?: string;
   NODE_ENV?: string;

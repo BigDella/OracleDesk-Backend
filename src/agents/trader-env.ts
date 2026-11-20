@@ -11,7 +11,10 @@ import { decisionPrice, type DecisionPrice } from '../services/market-price.serv
 import { config } from '../config';
 import { ForecastSession, forecastMarket, rankForForecast, type ForecastMarket } from '../services/forecast.service';
 import { exitPosition } from '../services/exit.service';
-import { markOpenPositions } from '../services/valuation.service';
+import { latestReserves, markOpenPositions, type MarketReserves } from '../services/valuation.service';
+import { getOnChainMarketCached } from '../services/chain.service';
+import { indexerLag, latestLedgerView, type IndexerLag } from '../services/chain-freshness.service';
+import type { PoolState } from '../services/impact-kelly';
 import { checkCorrelation } from '../services/correlation.service';
 import { evidenceFromSignals, generateReasoningTrace } from '../services/reasoning.service';
 import type { ProvenanceEntry } from '../lib/llm/provenance';
@@ -37,6 +40,7 @@ import type {
   CorrelationCheckResult,
   EnsembleForecast,
   HedgeRecommendation,
+  SourceWeightSetRef,
   WeightedSignal,
 } from '../types';
 
@@ -78,6 +82,11 @@ export interface MarketView {
 
 export { type DecisionPrice };
 
+/** FPMM reserves the trader sizes against (#225), with how far they trail the RPC's latest ledger. */
+export interface PoolView extends PoolState {
+  lagLedgers: number;
+}
+
 export interface Forecast {
   p: number;
   ci: ConfidenceInterval;
@@ -85,6 +94,8 @@ export interface Forecast {
   sources: WeightedSignal[];
   /** Per-model forecasts, weights and input digests (#75), pinned in the trace. */
   ensemble?: EnsembleForecast;
+  /** Weight set of the aggregation the forecast's signals came from (#223). */
+  weightSet?: SourceWeightSetRef;
 }
 
 export interface BuyOrder {
@@ -99,6 +110,8 @@ export interface BuyOrder {
   marketProb: number;
   edge: number;
   kelly: number;
+  /** Conservative probability of the side bought; execution refuses a fill whose average price reaches it (#225). */
+  conservativeProb: number;
   forecast: Forecast;
   correlation: CorrelationCheckResult;
   /** Kelly → correlation → caps, with the binding constraint and budget snapshot (#76). */
@@ -157,6 +170,53 @@ export interface TraderEnv {
   recordDecision(d: DecisionRecord): Promise<void>;
   /** Ledger-tagged decision price for a market (#266). Throws StalePriceError when no fresh source is available. */
   price(m: MarketView): Promise<DecisionPrice>;
+  /** Ledger-tagged FPMM reserves and the market's own fee_bps for sizing (#225); null when the market has none. */
+  pool(marketId: string): Promise<PoolView | null>;
+}
+
+/** Chain reads behind the production pool(); injectable for tests. */
+export interface PoolDeps {
+  reserves(onChainMarketId: bigint): Promise<MarketReserves>;
+  /** get_market with the ledger its simulation ran against (readWithLedger). */
+  marketWithLedger(onChainMarketId: bigint): Promise<{ reserveYes: bigint; reserveNo: bigint; feeBps: bigint; ledger: number }>;
+  latestLedger(): Promise<number>;
+  indexerLag(latestLedger: number): Promise<IndexerLag>;
+}
+
+export const defaultPoolDeps: PoolDeps = {
+  reserves: (id) => latestReserves(id, config.TRADER_POOL_MAX_AGE_LEDGERS),
+  async marketWithLedger(id) {
+    const entry = await getOnChainMarketCached(id);
+    return {
+      reserveYes: BigInt(entry.value.reserve_yes),
+      reserveNo: BigInt(entry.value.reserve_no),
+      feeBps: BigInt(entry.value.fee_bps),
+      ledger: entry.ledger,
+    };
+  },
+  latestLedger: async () => (await latestLedgerView()).latestLedger,
+  indexerLag: (latestLedger) => indexerLag({ latestLedger, latestCloseTime: 0, observedAt: 0 }),
+};
+
+/**
+ * Reserves for sizing, tagged with the ledger they are valid at. Indexed
+ * reserves are valid up to the indexer cursor (a quiet market's newest Trade
+ * can be old and still current), so their lag is the cursor's. get_market
+ * reserves come with the ledger its simulation ran against, never 0.
+ */
+export async function poolFromChain(onChainMarketId: bigint, deps: PoolDeps = defaultPoolDeps): Promise<PoolView> {
+  const r = await deps.reserves(onChainMarketId);
+  const latest = await deps.latestLedger();
+  if (r.source === 'indexed') {
+    const lag = await deps.indexerLag(latest);
+    const asOfLedger = lag.cursorLedger ?? r.asOfLedger;
+    return { ...r, asOfLedger, lagLedgers: Math.max(0, lag.lagLedgers ?? latest - asOfLedger) };
+  }
+  const m = await deps.marketWithLedger(onChainMarketId);
+  return {
+    reserveYes: m.reserveYes, reserveNo: m.reserveNo, feeBps: m.feeBps,
+    asOfLedger: m.ledger, source: 'rpc', lagLedgers: Math.max(0, latest - m.ledger),
+  };
 }
 
 /** Production env: Prisma, the chain service, the reasoning service and the wall clock. */
@@ -231,6 +291,7 @@ export function prodTraderEnv(): TraderEnv {
         ci: result.forecast.ci,
         sources: evidenceFromSignals(result.relevant),
         ensemble: result.forecast,
+        weightSet: signals.weightSet,
       };
     },
 
@@ -275,12 +336,13 @@ export function prodTraderEnv(): TraderEnv {
         betFraction:         order.kelly,
         betSizeUsdc:         order.amount,
         sizing:              order.sizing as unknown as Record<string, unknown>,
+        sourceWeightSet:     order.forecast.weightSet,
         correlation: {
           pairs:      order.correlation.correlatedPairs,
           method:     order.correlation.method ?? 'matrix',
           snapshotId: order.correlation.snapshotId ?? null,
         },
-      }, { upstreamProvenance: forecastProvenance });
+      }, undefined, { upstreamProvenance: forecastProvenance });
 
       // Execute trade (Never abort between chain write and DB update)
       const result = await executeTrade({
@@ -292,6 +354,7 @@ export function prodTraderEnv(): TraderEnv {
         price:         order.price,
         kellyFraction: order.kelly,
         edgeDetected:  order.edge,
+        conservativeProb: order.conservativeProb,
         traceId:       trace.id,
         tracePayload,
       });
@@ -355,6 +418,12 @@ export function prodTraderEnv(): TraderEnv {
     async price(m) {
       if (!m.onChainMarketId) throw new Error(`Market ${m.id} has no onChainMarketId`);
       return decisionPrice(m.onChainMarketId, { maxLagLedgers: config.TRADER_MAX_PRICE_LAG_LEDGERS });
+    },
+
+    async pool(marketId) {
+      const row = await prisma.market.findUnique({ where: { id: marketId }, select: { onChainMarketId: true } });
+      if (row?.onChainMarketId == null) return null;
+      return poolFromChain(BigInt(row.onChainMarketId));
     },
   };
 }

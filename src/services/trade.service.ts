@@ -34,9 +34,13 @@ const MIN_EDGE_THRESHOLD       = 0.08;   // 8 percentage points minimum edge
 const MIN_LIQUIDITY_USD        = 500;    // $500 minimum market liquidity
 const AGENT_SLIPPAGE_BPS       = 100n;   // min_shares_out = quote − 1%
 
-/** A bounded order (#245) whose limit or deadline can no longer be met: skipped, never sent. */
+/**
+ * A bounded order (#245) whose limit or deadline can no longer be met, or
+ * whose fresh average price has eaten the conservative edge (#225): skipped,
+ * never sent.
+ */
 export class TradeBoundError extends AppError {
-  constructor(code: 'LIMIT_PRICE_UNREACHABLE' | 'TRADE_DEADLINE_PASSED', message: string, details: Record<string, unknown>) {
+  constructor(code: 'LIMIT_PRICE_UNREACHABLE' | 'TRADE_DEADLINE_PASSED' | 'EDGE_CONSUMED', message: string, details: Record<string, unknown>) {
     super(409, code, message, details);
     this.name = 'TradeBoundError';
   }
@@ -230,7 +234,7 @@ export async function executeTrade(payload: TradePayload): Promise<{
       if (err instanceof TradeBoundError) {
         await prisma.trade.update({
           where: { id: trade.id },
-          data:  { status: 'CANCELLED', errorMessage: `${err.code}: ${err.message}` },
+          data:  { status: 'CANCELLED', errorMessage: err.code === 'EDGE_CONSUMED' ? err.message : `${err.code}: ${err.message}` },
         });
         await logAgentAction('TRADER', 'WARN', err.code, payload.marketId, { tradeId: trade.id, ...(err.details as object) });
         throw err;
@@ -486,6 +490,19 @@ async function submitTradeTransaction(
   const result = await agentBuy(
     async () => {
       const quoted = await quoteBuy(market.onChainMarketId!, outcome, collateralIn);
+      // #225: the order was sized on reserves that may have moved. If a share
+      // now costs the conservative probability or more, there is no edge left.
+      if (payload.conservativeProb !== undefined) {
+        const avgPriceBps = quoted > 0n ? (collateralIn * 10_000n) / quoted : null;
+        if (avgPriceBps === null || Number(avgPriceBps) >= payload.conservativeProb * 10_000) {
+          throw new TradeBoundError('EDGE_CONSUMED', 'edge consumed by price movement', {
+            avgPriceBps: avgPriceBps?.toString() ?? null,
+            conservativeProb: payload.conservativeProb,
+            collateralIn: collateralIn.toString(),
+            quotedShares: quoted.toString(),
+          });
+        }
+      }
       // #245: re-checked on every attempt, so a rebuild or retry never executes past
       // the decision's deadline or above the price at which the edge is gone.
       const bounds = payload.bounds;
