@@ -29,9 +29,9 @@ import { config } from '../config';
 import { logger } from '../lib/logger';
 import { correlation, newId } from '../lib/context';
 import { canonicalJson, sha256Hex } from '../utils/hash.util';
-import type { DecisionRecord, MarketView, TraderEnv, DecisionPrice } from './trader-env';
+import type { BuyOrder, DecisionRecord, MarketView, TraderEnv, DecisionPrice } from './trader-env';
 import { StalePriceError } from '../services/market-price.service';
-import type { AggregatedSignals } from '../types';
+import type { AggregatedSignals, ConfidenceInterval, KellyResult } from '../types';
 
 export interface TraderParams {
   minEdge: number;
@@ -72,6 +72,16 @@ export interface SizingRecord {
   /** Ledger view the decision was made against (#266). */
   priceAsOf: PriceAsOf;
 }
+
+export type ExplainStep =
+  | { step: 'FORECAST'; p: number; ci: ConfidenceInterval; available: boolean }
+  | { step: 'EDGE'; edge: number; minEdge: number; pass: boolean }
+  | { step: 'KELLY'; conservativeProb: number; sidePrice: number; result: KellyResult }
+  | { step: 'CAPS'; sizing: SizingRecord }
+  | { step: 'ORDER'; order: BuyOrder }
+  | { step: 'OUTCOME'; branch: string };
+
+export interface Explainer { step(step: ExplainStep): void }
 
 /** Budget state shared by the orders of one cycle. */
 interface CycleBudget {
@@ -189,7 +199,7 @@ export async function runTraderPolicy(
   let consecutiveStale = 0;
   for (const market of activeMarkets) {
     signal?.throwIfAborted();
-    const stale = await analyzeAndTradeMarket(env, params, cycle, market, signals, recordDecision, signal);
+    const stale = await analyzeMarket(env, params, cycle, market, signals, recordDecision, signal);
     if (stale) {
       consecutiveStale++;
       if (consecutiveStale >= config.TRADER_STALE_ABORT_COUNT) {
@@ -210,7 +220,7 @@ export async function runTraderPolicy(
 }
 
 /** Returns true when the market was skipped due to a stale price (for circuit breaker tracking). */
-async function analyzeAndTradeMarket(
+export async function analyzeMarket(
   env: TraderEnv,
   params: TraderParams,
   cycle: CycleBudget,
@@ -218,7 +228,12 @@ async function analyzeAndTradeMarket(
   signals: AggregatedSignals,
   recordDecision: (decision: Omit<DecisionRecord, 'cycleId'>) => Promise<void>,
   signal?: AbortSignal,
+  opts: { explain?: Explainer } = {},
 ): Promise<boolean> {
+  const finish = async (branch: string, stale = false) => {
+    opts.explain?.step({ step: 'OUTCOME', branch });
+    return stale;
+  };
   try {
     // Skip if we already have an open position in this market
     if (await env.hasOpenPosition(market.id)) {
@@ -228,7 +243,7 @@ async function analyzeAndTradeMarket(
         marketId: market.id,
         data: { reason: 'POSITION_ALREADY_OPEN' },
       });
-      return false;
+      return finish('POSITION_ALREADY_OPEN');
     }
 
     // Guard: skip markets without an on-chain id — price() cannot serve them (#266).
@@ -239,7 +254,7 @@ async function analyzeAndTradeMarket(
         marketId: market.id,
         data: { reason: 'NOT_ON_CHAIN' },
       });
-      return false;
+      return finish('MARKET_NOT_ON_CHAIN');
     }
 
     // Step 0 of pricing: get a ledger-tagged price BEFORE spending LLM budget on a forecast (#266).
@@ -253,7 +268,7 @@ async function analyzeAndTradeMarket(
           reasonCode: 'PRICE_STALE',
           data: { reason: 'PRICE_STALE', detail: (err as StalePriceError).details },
         });
-        return true; // signal stale to circuit breaker
+        return finish('PRICE_STALE', true); // signal stale to circuit breaker
       }
       throw err;
     }
@@ -267,6 +282,7 @@ async function analyzeAndTradeMarket(
     };
 
     const forecast = await env.forecast(market, signals);
+    opts.explain?.step({ step: 'FORECAST', p: forecast?.p ?? 0, ci: forecast?.ci ?? { lower: 0, upper: 0 }, available: Boolean(forecast) });
     if (!forecast) {
       await recordDecision({
         kind: 'SKIP',
@@ -274,13 +290,14 @@ async function analyzeAndTradeMarket(
         marketId: market.id,
         data: { reason: 'FORECAST_UNAVAILABLE', signalCount: signals.signalCount },
       });
-      return false;
+      return finish('FORECAST_UNAVAILABLE');
     }
     const forecastRef = sha256Hex(canonicalJson(forecast));
     const { p: agentProb, ci: confidenceInterval } = forecast;
 
     // Compute edge
     const edge = agentProb - marketProb;
+    opts.explain?.step({ step: 'EDGE', edge, minEdge: params.minEdge, pass: Math.abs(edge) >= params.minEdge });
 
     // Guard: insufficient edge
     if (Math.abs(edge) < params.minEdge) {
@@ -291,7 +308,7 @@ async function analyzeAndTradeMarket(
         forecastRef,
         data: { edge, minEdge: params.minEdge, p: forecast.p, marketProb },
       });
-      return false;
+      return finish('EDGE_BELOW_MIN');
     }
 
     // Kelly sizing — use conservative end of CI. Everything is from the side
@@ -312,6 +329,7 @@ async function analyzeAndTradeMarket(
       bankroll,
       netOdds:           (1 - sidePrice) / sidePrice,
     });
+    opts.explain?.step({ step: 'KELLY', conservativeProb, sidePrice, result: kellyResult });
 
     // Correlation check — may reduce position size
     const direction = edge > 0 ? 'YES' : 'NO';
@@ -326,7 +344,7 @@ async function analyzeAndTradeMarket(
         forecastRef,
         data: { reason: 'SIZE_ZERO_WIDE_CI', direction, edge, p: agentProb, ci: confidenceInterval },
       });
-      return false;
+      return finish('SIZE_ZERO_WIDE_CI');
     }
     const correlation = await env.correlation(market.id, kellyResult.betSize, direction, bankroll);
 
@@ -349,6 +367,7 @@ async function analyzeAndTradeMarket(
       budget: budgetSnapshot(budget),
       priceAsOf,
     };
+    opts.explain?.step({ step: 'CAPS', sizing });
 
     if (clamped.sizeRaw < MIN_TRADE_RAW) {
       logger.debug({ marketId: market.id, binding, finalRaw: sizing.finalRaw }, 'Position size below minimum after caps — skipping');
@@ -360,7 +379,7 @@ async function analyzeAndTradeMarket(
         sizingRecord: sizing as unknown as Record<string, unknown>,
         data: { reason: 'SIZE_BELOW_MIN', direction, edge, sizing },
       });
-      return false;
+      return finish('SIZE_BELOW_MIN');
     }
 
     const amount = toDisplayUsdc(clamped.sizeRaw);
@@ -368,7 +387,7 @@ async function analyzeAndTradeMarket(
 
     signal?.throwIfAborted();
 
-    const result = await env.buy({
+    const order: BuyOrder = {
       marketId: market.id,
       direction,
       amount,
@@ -381,7 +400,9 @@ async function analyzeAndTradeMarket(
       correlation,
       sizing,
       priceAsOf,
-    });
+    };
+    opts.explain?.step({ step: 'ORDER', order });
+    const result = await env.buy(order);
     if (result.ok) cycle.current = spend(cycle.current, clamped.sizeRaw);
     await recordDecision({
       kind: result.ok ? 'BUY' : 'SKIP',
@@ -397,7 +418,7 @@ async function analyzeAndTradeMarket(
     });
 
     if (result.ok) logger.info({ marketId: market.id, direction, amount, binding, edge }, 'Trader Agent: trade executed');
-    return false;
+    return finish(result.ok ? 'BUY_ACCEPTED' : 'BUY_REJECTED');
   } catch (err) {
     logger.warn({ err, marketId: market.id }, 'Trader Agent: market analysis failed');
     await recordDecision({
@@ -407,6 +428,6 @@ async function analyzeAndTradeMarket(
       data: { error: String(err).slice(0, 300) },
       outcome: { status: 'FAILED' },
     });
-    return false;
+    return finish('MARKET_ANALYSIS_FAILED');
   }
 }

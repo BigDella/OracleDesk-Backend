@@ -1,4 +1,5 @@
 import { prisma } from '../lib/prisma';
+import { seedReserves } from '../generated/fpmm';
 import { logger } from '../lib/logger';
 import { writeAgentLog } from '../lib/agent-log';
 import { CONTRACTS } from '../config/contracts';
@@ -230,6 +231,8 @@ export async function linkLandedMarket(
 ): Promise<boolean> {
   try {
     await prisma.$transaction(async (tx) => {
+      const market = await tx.market.findUnique({ where: { id: marketId } });
+      if (!market) throw new Error(`Market ${marketId} not found`);
       await tx.market.update({
         where: { id: marketId },
         data: {
@@ -254,6 +257,27 @@ export async function linkLandedMarket(
           claimLeaseExpiresAt: new Date(),
         },
       });
+
+      // Record the treasury-owned seed immediately; fee-ledger enrichment is
+      // intentionally deferred until the deployed market-core exposes it.
+      if (market.seedAmountRaw) {
+        const policy = (market.seedPolicy ?? {}) as Record<string, unknown>;
+        const openBps = Number(policy.initialYesBps ?? Math.round(market.initialYesProb * 10_000));
+        const reserves = seedReserves(BigInt(market.seedAmountRaw), BigInt(openBps));
+        await tx.lpPosition.upsert({
+          where: { marketId },
+          create: {
+            marketId,
+            onChainMarketId,
+            seedRaw: market.seedAmountRaw,
+            openBps,
+            creatorYesRaw: reserves.creatorYes.toString(),
+            creatorNoRaw: reserves.creatorNo.toString(),
+            expectedLpLossRaw: typeof policy.expectedLpLossRaw === 'string' ? policy.expectedLpLossRaw : null,
+          },
+          update: { onChainMarketId },
+        });
+      }
     });
     return true;
   } catch (err: any) {

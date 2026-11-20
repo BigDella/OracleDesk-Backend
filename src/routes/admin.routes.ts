@@ -10,6 +10,7 @@ import {
   getAdminRoles,
   getAdmins,
   getAgentControls,
+  getAgentKeys,
   getAgentDecisions,
   getAgentDecisionCycles,
   getAgentDecisionCycleFunnel,
@@ -64,6 +65,7 @@ router.post('/treasury/operations/:id/submit', requirePermission('treasury.opera
 router.post('/treasury/operations/:id/record', requirePermission('treasury.operate'), requireStepUp, recordTreasuryOperation);
 router.post('/treasury/operations/:id/cancel', requirePermission('treasury.operate'), requireStepUp, cancelTreasuryOperation);
 router.get('/agents/controls', requirePermission('agents.manage'), getAgentControls);
+router.get('/agents/keys', requirePermission('agents.manage'), getAgentKeys);
 router.get('/agent-decisions', requirePermission('admin.read'), getAgentDecisions);
 router.get('/agent-decisions/cycles', requirePermission('admin.read'), getAgentDecisionCycles);
 router.get('/agent-decisions/cycles/:cycleId', requirePermission('admin.read'), getAgentDecisionCycleFunnel);

@@ -15,6 +15,8 @@ import type {
 } from '../types';
 import { now as clockNow } from '../lib/clock';
 import { AppError } from '../middlewares/error.middleware';
+import { buildTraceDoc, type TraceDocV1 } from '../schemas/trace';
+import { newId } from '../lib/context';
 
 // The hedge-condition schema lives in src/lib/llm-schema.ts; re-exported here.
 export { traceReasoningSchema };
@@ -51,28 +53,24 @@ export async function generateReasoningTrace(
   // canonicalJson would encode differently from the contracts repo.
   const provenance = buildTraceProvenance([...(opts.upstreamProvenance ?? []), hedgeConditions.provenance]);
 
+  const traceId = newId('req');
   const traceDoc: TraceDocV1 = buildTraceDoc({
     traceId,
     agentType: input.agentType,
     decisionType: input.decisionType,
     action: input.decisionType.toLowerCase(),
     backendMarketId: input.marketId,
-    onChainMarketId,
+    onChainMarketId: null,
     probabilityEstimate: input.probabilityEstimate,
     marketProbability: input.marketProbability,
     edge,
     confidenceInterval:  ci,
+    sourcesUsed: input.sourcesUsed,
     betFraction:         input.betFraction,
     betSizeUsdc:         input.betSizeUsdc,
-    correlation:         input.correlation,
-    seedPolicy:          input.seedPolicy,
-    forecast:            input.forecast,
-    sizing:              input.sizing,
     hedgeConditions:     hedgeConditions.conditions,
-    provenance,
     agentWallet:         input.agentWallet,
-    timestamp:           clockNow().toISOString(),
-  };
+  });
 
   // The free preview names the source and headline only; links and ids are
   // part of the paid trace (#73).

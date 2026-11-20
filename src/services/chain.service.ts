@@ -21,7 +21,7 @@ import type { rpc } from '@stellar/stellar-sdk';
 import { config } from '../config';
 import { CONTRACTS } from '../config/contracts';
 import { logger } from '../lib/logger';
-import { agentClients, agentSigner, readClients } from './stellar/clients';
+import { agentClients, agentKeypair, agentSigner, signerFor, readClients } from './stellar/clients';
 import { ChainError, ChainPendingError, TransactionError, contractErrorName, ArchivedEntryError } from './stellar/errors';
 import {
   parseReturnValue,
@@ -83,6 +83,11 @@ import {
 export { ExpiredError, ArchivedEntryError };
 
 type ContractKey = 'marketCore' | 'treasury' | 'resolver' | 'reasoningRegistry';
+
+function writeRole(scope: AgentScope, contract: WriteContract, method: string) {
+  if (contract === 'resolver' || contract === 'reasoningRegistry') return 'OPS' as const;
+  return scope;
+}
 
 export interface FeeDetails {
   opClass: OperationClass;
@@ -306,13 +311,15 @@ async function submitWrite<T>(
 
   let leasedChannel: LeasedChannel | null = null;
   let signer: Signer | undefined = undefined;
+  const role = writeRole(scope, contract, method);
 
   if (config.CHAIN_EXECUTION_MODE === 'live') {
     const pool = getChannelPool();
     if (pool.size > 0) {
       leasedChannel = await pool.acquire();
-      const agentKeypair = Keypair.fromSecret(config.AGENT_SECRET_KEY);
-      signer = channelSigner(leasedChannel.channel.keypair, agentKeypair);
+      signer = channelSigner(leasedChannel.channel.keypair, agentKeypair(role));
+    } else {
+      signer = signerFor(role);
     }
   }
 
@@ -618,7 +625,9 @@ async function attemptWrite<T>(
   const inclusionFee = await oracle.pickInclusionFee(opClass);
   const timeoutInSeconds = timeoutFor(opClass);
   const store = prismaOutboxStore();
-  const account = agentSigner().publicKey as string;
+  const role = writeRole(scope, contract, method);
+  const roleSigner = signerFor(role);
+  const account = roleSigner.publicKey as string;
   let outboxRow: ChainTransactionRow | null = null;
 
   try {
@@ -627,7 +636,7 @@ async function attemptWrite<T>(
       async (ctx) => {
         let tx: AssembledTransaction<unknown>;
         try {
-          tx = await call({ fee: inclusionFee, timeoutInSeconds });
+          tx = await call({ fee: inclusionFee, timeoutInSeconds }, roleSigner);
         } catch (err) {
           throw new ChainError(`${method} could not be built`, contractErrorName(contract, err), {
             method,

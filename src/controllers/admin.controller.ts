@@ -22,7 +22,7 @@ import { config } from '../config';
 import { secret } from '../config/secrets';
 import { health } from '../services/health.service';
 import { indexerStatus } from '../services/indexer.service';
-import { agentSigner } from '../services/stellar/clients';
+import { agentAddresses, agentSigner } from '../services/stellar/clients';
 import { effectiveMode, specCompatReport } from '../services/stellar/spec-compat';
 import { getFeeOracle } from '../services/stellar/fees';
 import { getLlmUsage } from '../lib/llm-budget';
@@ -166,6 +166,15 @@ export async function retireChainSigningKey(req: Request, res: Response): Promis
 /** GET /admin/agents/controls: effective state per scope plus the last 20 audit events. */
 export async function getAgentControls(_req: Request, res: Response): Promise<void> {
   sendSuccess(res, await controlsOverview());
+}
+
+/** GET /admin/agents/keys: public identities only; never expose secret material. */
+export function getAgentKeys(_req: Request, res: Response): void {
+  const addresses = agentAddresses();
+  sendSuccess(res, {
+    agents: Object.entries(addresses).map(([role, publicKey]) => ({ role, publicKey })),
+    shared: new Set(Object.values(addresses)).size === 1,
+  });
 }
 
 function agentParam(req: Request) {

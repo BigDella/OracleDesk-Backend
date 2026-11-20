@@ -127,23 +127,6 @@ enum GenerationJobStatus {
   FAILED
 }
 
-enum GenerationRunState {
-  STARTED
-  SIGNALS_READY
-  PROPOSED
-  MARKET_PERSISTED
-  QUESTION_PINNED
-  CHAIN_SUBMITTED
-  CHAIN_CONFIRMED
-  TRACE_PERSISTED
-  TRACE_PINNED
-  TRACE_PUBLISHED
-  COMPLETED
-  SKIPPED
-  NEEDS_ATTENTION
-  CANCELLED
-}
-
 enum TraceAuditStatus {
   VERIFIED
   HASH_MISMATCH
@@ -325,6 +308,7 @@ model Market {
   agentDecisions AgentDecision[]
   agentLogs      AgentLog[]
   creationAttempt MarketCreationAttempt?
+  lpPosition      LpPosition?
 
   @@index([status])
   @@index([category])
@@ -334,6 +318,33 @@ model Market {
   @@index([lastReconciledAt])
   @@index([resolutionSpec], type: Gin)
   @@map("markets")
+}
+
+/// Treasury-owned liquidity seeded when the market maker creates a market.
+/// Fee and valuation fields remain nullable until the deployed market-core
+/// exposes the corresponding LP ledger entries.
+model LpPosition {
+  marketId          String   @id
+  onChainMarketId   BigInt   @unique
+  seedRaw           Decimal  @db.Decimal(39, 0)
+  openBps           Int
+  creatorYesRaw     Decimal  @db.Decimal(39, 0)
+  creatorNoRaw      Decimal  @db.Decimal(39, 0)
+  protocolShareBps  Int?
+  lpFeesAccruedRaw  Decimal  @default(0) @db.Decimal(39, 0)
+  lpFeesOnChainRaw  Decimal? @db.Decimal(39, 0)
+  lpFeesClaimedRaw  Decimal  @default(0) @db.Decimal(39, 0)
+  markValueRaw      Decimal? @db.Decimal(39, 0)
+  settledValueRaw   Decimal? @db.Decimal(39, 0)
+  expectedLpLossRaw Decimal? @db.Decimal(39, 0)
+  status            String   @default("OPEN")
+  lastEventLedger   Int?
+  updatedAt         DateTime @updatedAt @db.Timestamptz(3)
+
+  market Market @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@map("lp_positions")
 }
 
 // Background job for market generation process, tracking status and errors
@@ -350,27 +361,6 @@ model MarketGenerationJob {
 
   @@index([status])
   @@map("market_generation_jobs")
-}
-
-model MarketGenerationRun {
-  id            String            @id @default(uuid())
-  trigger       String
-  state         GenerationRunState @default(STARTED)
-  attempts      Int               @default(0)
-  nextAttemptAt DateTime?
-  lockedBy      String?
-  lockedUntil   DateTime?
-  inputs        Json?
-  outputs       Json              @default("{}")
-  marketId      String?           @unique
-  lastError     Json?
-  createdAt     DateTime          @default(now())
-  updatedAt     DateTime          @updatedAt
-
-  market Market? @relation(fields: [marketId], references: [id], onDelete: SetNull)
-
-  @@index([state, nextAttemptAt])
-  @@map("market_generation_runs")
 }
 
 /// Individual trade executed by the Trader Agent
@@ -1671,6 +1661,7 @@ model WalletPnlDirtyMarket {
   reason          String?
 
   @@map("wallet_pnl_dirty_markets")
+}
 /// Short-lived exclusive hold on a question that prevents concurrent cycles
 /// from creating duplicate markets. Rows are HELD until the market is inserted
 /// (then COMMITTED), or released on skip/abort/failure.
