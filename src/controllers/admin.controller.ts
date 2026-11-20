@@ -603,3 +603,31 @@ export async function abandonChainTransaction(req: Request, res: Response): Prom
   const id = outboxId(req);
   sendSuccess(res, await abandon(id, actor(req), outboxReason(req)));
 }
+
+// ─── LLM Canary & Demotions (#296) ───────────────────────────────────────────
+
+const demotionOverrideSchema = z.object({
+  task: z.enum(['market_generation', 'hedge_conditions', 'forecasting', 'attestation', 'dispute_review', 'generic_json', 'generic_text']),
+  provider: z.enum(['anthropic', 'gemini', 'openai']),
+  model: z.string().min(1),
+  active: z.boolean(),
+  reason: z.string().max(300).optional(),
+  ttlHours: z.number().int().min(1).max(720).optional(),
+});
+
+/** GET /admin/llm/canary — recent canary runs, baselines, and active model demotions. */
+export async function getLlmCanaryStatus(_req: Request, res: Response): Promise<void> {
+  const { getCanaryAdminView } = await import('../services/llm-canary.service');
+  sendSuccess(res, await getCanaryAdminView());
+}
+
+/** POST /admin/llm/demotions — set or clear a time-limited model demotion override. */
+export async function overrideLlmDemotion(req: Request, res: Response): Promise<void> {
+  const parsed = demotionOverrideSchema.safeParse(req.body);
+  if (!parsed.success) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Invalid demotion payload', parsed.error.flatten().fieldErrors);
+  }
+  const { setAdminModelDemotion } = await import('../services/llm-canary.service');
+  const row = await setAdminModelDemotion(parsed.data);
+  sendSuccess(res, { active: parsed.data.active, demotion: row });
+}

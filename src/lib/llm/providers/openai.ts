@@ -98,6 +98,7 @@ export const openaiProvider: LlmProvider = {
       if (!text) throw new LlmError('empty', 'openai', 'OpenAI-compatible provider returned an empty response', undefined, []);
       return {
         text,
+        ...(typeof completion.model === 'string' && completion.model ? { servedModel: completion.model } : {}),
         usage: {
           inputTokens: completion.usage?.prompt_tokens,
           outputTokens: completion.usage?.completion_tokens,

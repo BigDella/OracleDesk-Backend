@@ -2122,3 +2122,64 @@ model MoneyAuditFinding {
   @@index([fingerprint])
   @@map("money_audit_findings")
 }
+
+/// Statistical baseline per (task, provider, model, promptVersion) for canary drift detection (#296).
+model LlmCanaryBaseline {
+  id            String   @id @default(uuid())
+  task          String
+  provider      String
+  model         String
+  promptVersion Int
+  sampleCount   Int
+  passCount     Int
+  passRate      Float
+  meanScore     Float
+  scoreStdDev   Float    @default(0)
+  metricsJson   Json     @default("{}")
+  createdAt     DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @db.Timestamptz(3)
+
+  @@unique([task, provider, model, promptVersion])
+  @@map("llm_canary_baselines")
+}
+
+/// One daily canary evaluation run for a (task, provider, model) chain entry (#296).
+model LlmCanaryRun {
+  id             String   @id @default(uuid())
+  task           String
+  provider       String
+  model          String
+  servedModel    String?
+  promptVersion  Int
+  sampleCount    Int
+  passCount      Int
+  passRate       Float
+  meanScore      Float
+  pValue         Float?
+  drifted        Boolean  @default(false)
+  driftReason    String?
+  budgetSpentUsd Float    @default(0)
+  details        Json     @default("{}")
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([task, model, createdAt])
+  @@map("llm_canary_runs")
+}
+
+/// Time-limited model demotion (by canary auto-demotion or admin override) (#296).
+model LlmModelDemotion {
+  id        String   @id @default(uuid())
+  task      String
+  provider  String
+  model     String
+  reason    String
+  /// canary | admin
+  demotedBy String   @default("canary")
+  expiresAt DateTime @db.Timestamptz(3)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([task, active, expiresAt])
+  @@map("llm_model_demotions")
+}
