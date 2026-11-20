@@ -177,6 +177,9 @@ export interface CompletionOutcome {
   value?: unknown;
   txHash?: string | null;
   error?: string | null;
+  /** Full GetTransactionResponse when available, so handlers can read events without re-fetching. */
+  confirmedTx?: unknown;
+  ledger?: number | null;
 }
 
 export type CompletionHandler = (row: ChainTransactionRow, outcome: CompletionOutcome) => Promise<void>;
@@ -566,7 +569,17 @@ export async function recoverRow(
       });
       if (moved) {
         await applyLandedHash(moved, landed.hash);
-        await runCompletionHandler(moved, { status: 'SUCCESS', value, txHash: landed.hash }, store);
+        await runCompletionHandler(
+          moved,
+          {
+            status: 'SUCCESS',
+            value,
+            txHash: landed.hash,
+            confirmedTx: landed.resp,
+            ledger: anyResp.ledger ?? null,
+          },
+          store,
+        );
         stats.resolved++;
         stats.handled++;
       }

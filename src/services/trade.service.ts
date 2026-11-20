@@ -27,6 +27,7 @@ import {
 import { config } from '../config';
 import { TREASURY_CAP_ERRORS } from './treasury-budget.service';
 import { ChainError } from './stellar/errors';
+import { checkFillDiscrepancies, resolveAgentTradeFill } from './agent-fill.service';
 
 // ─── Risk constants ───
 const MAX_CORRELATED_EXPOSURE  = 0.05;   // 5% total correlated exposure
@@ -56,7 +57,17 @@ export { calculateKellySize } from './kelly';
  */
 export async function applyBuySuccess(
   tradeId: string,
-  fill: { sharesOut: bigint; collateralIn: bigint; feeRaw: bigint; txHash: string | null; innerTxHash: string | null },
+  fill: {
+    sharesOut: bigint;
+    collateralIn: bigint;
+    feeRaw: bigint;
+    txHash: string | null;
+    innerTxHash: string | null;
+    reserveYesRaw?: bigint | null;
+    reserveNoRaw?: bigint | null;
+    fillLedger?: number | null;
+    fillMismatch?: Record<string, unknown> | null;
+  },
 ): Promise<void> {
   const trade = await prisma.trade.findUnique({ where: { id: tradeId }, select: { id: true, marketId: true, direction: true, amount: true } });
   if (!trade) return;
@@ -74,6 +85,10 @@ export async function applyBuySuccess(
       collateralRaw: bigintToDecimalString(fill.collateralIn),
       sharesRaw: bigintToDecimalString(fill.sharesOut),
       feeRaw: bigintToDecimalString(fill.feeRaw),
+      ...(fill.reserveYesRaw != null ? { reserveYesRaw: bigintToDecimalString(fill.reserveYesRaw) } : {}),
+      ...(fill.reserveNoRaw != null ? { reserveNoRaw: bigintToDecimalString(fill.reserveNoRaw) } : {}),
+      ...(fill.fillLedger != null ? { fillLedger: fill.fillLedger } : {}),
+      ...(fill.fillMismatch != null ? { fillMismatch: fill.fillMismatch as Prisma.InputJsonValue } : {}),
       ...(fillPriceBps === null ? {} : { fillPriceBps }),
     },
   });
@@ -120,13 +135,45 @@ export async function handleTradeBuyOutcome(row: ChainTransactionRow, outcome: C
     return;
   }
 
-  const args = (row.args ?? {}) as { collateral_in?: string; feeRaw?: string };
+  const args = (row.args ?? {}) as { collateral_in?: string; feeRaw?: string; min_shares_out?: string };
+  const trade = await prisma.trade.findUnique({
+    where: { id: tradeId },
+    select: { marketId: true, direction: true, market: { select: { onChainMarketId: true } } },
+  });
+
+  const eventFill = await resolveAgentTradeFill({
+    confirmedTx: outcome.confirmedTx,
+    txHashes: [outcome.txHash, row.landedHash, row.hash],
+    onChainMarketId: trade?.market?.onChainMarketId ?? undefined,
+    isBuy: true,
+    outcome: trade?.direction === 'NO' ? 'No' : 'Yes',
+  });
+
+  const simulatedShares = outcome.value !== undefined && outcome.value !== null ? BigInt(String(outcome.value)) : null;
+  const requestedCollateral = args.collateral_in ? BigInt(args.collateral_in) : null;
+  const minSharesOut = args.min_shares_out ? BigInt(args.min_shares_out) : null;
+
+  const fillMismatch = eventFill
+    ? await checkFillDiscrepancies(eventFill, {
+        simulatedShares,
+        minSharesOut,
+        requestedCollateral,
+        marketId: trade?.marketId ?? null,
+        refId: tradeId,
+        kind: 'buy',
+      })
+    : null;
+
   await applyBuySuccess(tradeId, {
-    sharesOut: BigInt(String(outcome.value ?? '0')),
-    collateralIn: BigInt(args.collateral_in ?? '0'),
-    feeRaw: BigInt(args.feeRaw ?? '0'),
-    txHash: outcome.txHash ?? null,
+    sharesOut: eventFill ? eventFill.shares : (simulatedShares ?? 0n),
+    collateralIn: eventFill ? eventFill.collateral : (requestedCollateral ?? 0n),
+    feeRaw: eventFill ? eventFill.fee : BigInt(args.feeRaw ?? '0'),
+    txHash: outcome.txHash ?? row.landedHash ?? null,
     innerTxHash: row.hash,
+    reserveYesRaw: eventFill?.reserveYes ?? null,
+    reserveNoRaw: eventFill?.reserveNo ?? null,
+    fillLedger: eventFill?.ledger ?? outcome.ledger ?? null,
+    fillMismatch,
   });
 }
 

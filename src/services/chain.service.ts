@@ -1062,7 +1062,13 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
     // The completion handler has run by the time write() resolves, so callers
     // read success state back instead of writing it (#35). Idempotent: a crash
     // here is re-run by the recovery worker.
-    await runCompletionHandler(successRow, { status: 'SUCCESS', value, txHash: finalHash }).catch((err) =>
+    await runCompletionHandler(successRow, {
+      status: 'SUCCESS',
+      value,
+      txHash: finalHash,
+      confirmedTx,
+      ledger: (confirmedTx as any)?.ledger ?? null,
+    }).catch((err) =>
       logger.error({ err, outboxId: successRow.id, kind: successRow.kind }, 'completion handler failed; recovery will retry'),
     );
   }

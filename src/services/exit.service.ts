@@ -22,6 +22,7 @@ import { logger } from '../lib/logger';
 import { writeAgentLog } from '../lib/agent-log';
 import { AppError } from '../middlewares/error.middleware';
 import { CONTRACTS } from '../config/contracts';
+import { checkFillDiscrepancies, resolveAgentTradeFill } from './agent-fill.service';
 import {
   bigintToDecimalString,
   decimalToBigint,
@@ -227,12 +228,23 @@ async function recordFailure(
 async function applyConfirmedExit(
   position: LoadedPosition,
   exitId: string,
-  p: { sold: bigint; collateralOut: bigint; txHash: string | null; reason: string; note?: string },
+  p: {
+    sold: bigint;
+    collateralOut: bigint;
+    txHash: string | null;
+    reason: string;
+    note?: string;
+    feeRaw?: bigint | null;
+    reserveYesRaw?: bigint | null;
+    reserveNoRaw?: bigint | null;
+    fillLedger?: number | null;
+    fillMismatch?: Record<string, unknown> | null;
+  },
 ): Promise<{ closed: boolean; applied: boolean }> {
   const result = await prisma.$transaction(async (tx) => {
     const [current] = await tx.$queryRaw<
-      Array<{ sharesRaw: Prisma.Decimal | null; costBasisRaw: Prisma.Decimal | null; realisedCollateralRaw: Prisma.Decimal; realisedPnlRaw: Prisma.Decimal }>
-    >`SELECT "sharesRaw", "costBasisRaw", "realisedCollateralRaw", "realisedPnlRaw" FROM positions WHERE id = ${position.id} FOR UPDATE`;
+      Array<{ sharesRaw: Prisma.Decimal | null; costBasisRaw: Prisma.Decimal | null; feesPaidRaw: Prisma.Decimal | null; realisedCollateralRaw: Prisma.Decimal; realisedPnlRaw: Prisma.Decimal }>
+    >`SELECT "sharesRaw", "costBasisRaw", "feesPaidRaw", "realisedCollateralRaw", "realisedPnlRaw" FROM positions WHERE id = ${position.id} FOR UPDATE`;
     if (!current) return null;
 
     const sharesBefore = decimalToBigint(current.sharesRaw as never);
@@ -244,7 +256,9 @@ async function applyConfirmedExit(
     const closed = remaining <= DUST_SHARES;
     const costSold = closed || sharesBefore === 0n ? costBefore : (costBefore * sold) / sharesBefore;
     const realisedPnlRaw = decimalToBigint(current.realisedPnlRaw) + (p.collateralOut - costSold);
-    const effectivePrice = sold > 0n ? Math.min(1, Number(p.collateralOut) / Number(sold)) : null;
+    const effectivePriceBps = priceBpsFromRaw(p.collateralOut, sold);
+    const effectivePrice = effectivePriceBps === null ? null : effectivePriceBps / 10_000;
+    const feesPaidAfter = p.feeRaw != null ? decimalToBigint(current.feesPaidRaw ?? '0') + p.feeRaw : null;
 
     const won = await tx.positionExit.updateMany({
       where: { id: exitId, status: 'SUBMITTED' },
@@ -256,6 +270,11 @@ async function applyConfirmedExit(
         effectivePriceBps,
         txHash: p.txHash,
         error: p.note ?? null,
+        ...(p.feeRaw != null ? { feeRaw: bigintToDecimalString(p.feeRaw) } : {}),
+        ...(p.reserveYesRaw != null ? { reserveYesRaw: bigintToDecimalString(p.reserveYesRaw) } : {}),
+        ...(p.reserveNoRaw != null ? { reserveNoRaw: bigintToDecimalString(p.reserveNoRaw) } : {}),
+        ...(p.fillLedger != null ? { fillLedger: p.fillLedger } : {}),
+        ...(p.fillMismatch != null ? { fillMismatch: p.fillMismatch as Prisma.InputJsonValue } : {}),
       },
     });
     if (won.count === 0) return null;
@@ -264,6 +283,7 @@ async function applyConfirmedExit(
       data: {
         sharesRaw: bigintToDecimalString(remaining),
         costBasisRaw: bigintToDecimalString(costBefore - costSold),
+        ...(feesPaidAfter != null ? { feesPaidRaw: bigintToDecimalString(feesPaidAfter) } : {}),
         realisedCollateralRaw: bigintToDecimalString(decimalToBigint(current.realisedCollateralRaw) + p.collateralOut),
         realisedPnlRaw: bigintToDecimalString(realisedPnlRaw),
         pnl: toDisplayUsdc(realisedPnlRaw),
@@ -472,12 +492,17 @@ export async function exitPosition(
       // #35: the trade.sell completion handler may already have applied this
       // before agentSell resolved; applyConfirmedExit's CAS makes the second
       // call a read-back, so exactly one of the two applies the deltas.
-      const { closed } = await applyConfirmedExit(position, row.id, {
+      const { closed, applied } = await applyConfirmedExit(position, row.id, {
         sold,
         collateralOut: plan.collateralOut,
         txHash: result.txHash,
         reason: opts.reason,
       });
+      const confirmedRow = applied
+        ? null
+        : await prisma.positionExit.findUnique({ where: { id: row.id }, select: { sharesSoldRaw: true, collateralOutRaw: true } });
+      const finalSold = confirmedRow ? decimalToBigint(confirmedRow.sharesSoldRaw) : sold;
+      const finalCollateralOut = confirmedRow ? decimalToBigint(confirmedRow.collateralOutRaw) : plan.collateralOut;
       await writeAgentLog({
         agentType: 'TRADER',
         level: 'INFO',
@@ -487,13 +512,13 @@ export async function exitPosition(
           positionId,
           exitId: row.id,
           reason: opts.reason,
-          sharesSoldRaw: sold.toString(),
-          collateralOutRaw: plan.collateralOut.toString(),
+          sharesSoldRaw: finalSold.toString(),
+          collateralOutRaw: finalCollateralOut.toString(),
           txHash: result.txHash,
         },
       }).catch(() => undefined);
       logger.info({ positionId, exitId: row.id, closed }, 'Position exit confirmed');
-      return { exitId: row.id, status: 'CONFIRMED', sharesSoldRaw: sold, collateralOutRaw: plan.collateralOut, closed };
+      return { exitId: row.id, status: 'CONFIRMED', sharesSoldRaw: finalSold, collateralOutRaw: finalCollateralOut, closed };
     } catch (err) {
       const kind = classify(err);
 
@@ -555,11 +580,40 @@ export async function handleTradeSellOutcome(row: ChainTransactionRow, outcome: 
 
   const position = await loadPosition(exit.positionId);
   if (!position) return;
+
+  const eventFill = await resolveAgentTradeFill({
+    confirmedTx: outcome.confirmedTx,
+    txHashes: [outcome.txHash, row.landedHash, row.hash],
+    onChainMarketId: position.market?.onChainMarketId ?? undefined,
+    isBuy: false,
+    outcome: position.direction === 'NO' ? 'No' : 'Yes',
+  });
+
+  const simulatedShares = outcome.value !== undefined && outcome.value !== null ? BigInt(String(outcome.value)) : null;
+  const requestedCollateral = decimalToBigint(exit.collateralOutRaw ?? '0');
+  const maxSharesIn = decimalToBigint(exit.maxSharesInRaw ?? '0');
+
+  const fillMismatch = eventFill
+    ? await checkFillDiscrepancies(eventFill, {
+        simulatedShares,
+        maxSharesIn,
+        requestedCollateral,
+        marketId: position.marketId,
+        refId: exitId,
+        kind: 'sell',
+      })
+    : null;
+
   await applyConfirmedExit(position, exitId, {
-    sold: BigInt(String(outcome.value ?? '0')),
-    collateralOut: decimalToBigint(exit.collateralOutRaw ?? '0'),
-    txHash: outcome.txHash ?? null,
+    sold: eventFill ? eventFill.shares : (simulatedShares ?? 0n),
+    collateralOut: eventFill ? eventFill.collateral : requestedCollateral,
+    txHash: outcome.txHash ?? row.landedHash ?? null,
     reason: exit.reason,
+    feeRaw: eventFill?.fee ?? null,
+    reserveYesRaw: eventFill?.reserveYes ?? null,
+    reserveNoRaw: eventFill?.reserveNo ?? null,
+    fillLedger: eventFill?.ledger ?? outcome.ledger ?? null,
+    fillMismatch,
   });
 }
 
