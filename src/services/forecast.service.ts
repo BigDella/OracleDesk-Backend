@@ -29,8 +29,7 @@ import { now as clockNow } from '../lib/clock';
 import { callLLMStructured } from '../lib/llm';
 import { LlmBudgetExceeded } from '../lib/llm-budget';
 import { defineStructured } from '../lib/llm-schema';
-import { forecastV2 } from '../lib/prompts';
-import { writeAgentLog } from '../lib/agent-log';
+import { forecastV1, getPrompt, type ForecastVars, type PromptDef } from '../lib/prompts';
 import { canonicalJson, sha256Hex, verifyTraceHash } from '../utils/hash.util';
 import type { LlmProvenance } from '../lib/llm/provenance';
 import { fetchIpfsBytes } from './ipfs.service';
@@ -247,14 +246,12 @@ export const forecastSpec = defineStructured(
   (v) => (v.p_low_50 <= v.p && v.p <= v.p_high_50 ? null : 'p_low_50 <= p <= p_high_50 must hold'),
 );
 
-/** The rendered prompt, citation map, exact sent sources, and quarantined ids (#75, #304). */
-export function buildForecastPrompt(input: ForecastInput): {
-  system: string;
-  user: string;
-  citations: Record<string, string | undefined>;
-  sent: CitationSource[];
-  quarantinedIds: string[];
-} {
+/** The rendered prompt and the signal ids it cites (s1…), for the trace and tests. */
+export function buildForecastPrompt(
+  input: ForecastInput,
+  promptDef: PromptDef<ForecastVars> = forecastV1,
+  fixedNonce?: string,
+): { system: string; user: string; citations: Record<string, string | undefined> } {
   const sanitized = input.signals.map((s, i) => ({
     ...sanitizeSignal({
       source: s.source,
@@ -269,22 +266,9 @@ export function buildForecastPrompt(input: ForecastInput): {
   }));
   const { clean, quarantined } = partitionSignals(sanitized);
   const citations = Object.fromEntries(clean.map((s) => [s.id, input.signals[Number(s.id.slice(1)) - 1]?.id]));
-  const sent: CitationSource[] = clean.map((s) => {
-    const orig = input.signals[Number(s.id.slice(1)) - 1];
-    const numeric = parseFredNumeric(s.source, s.title);
-    return {
-      promptId: s.id,
-      signalId: orig?.id ?? null,
-      source: s.source,
-      title: s.title,
-      url: canonicalUrl(orig?.url ?? s.url ?? null),
-      ...(numeric ? { numeric } : {}),
-    };
-  });
-  const quarantinedIds = quarantined.map((s) => s.id);
-  const doc = input.questionDoc ? renderUntrustedRecord(input.questionDoc, 'question_document', undefined, 600) : null;
+  const doc = input.questionDoc ? renderUntrustedRecord(input.questionDoc, 'question_document', fixedNonce, 600) : null;
   const daysToClose = Math.max(0, Math.round((input.closeTime.getTime() - input.now.getTime()) / 86_400_000));
-  const { system, user } = forecastV2.render({
+  const { system, user } = promptDef.render({
     now: input.now.toISOString(),
     question: sanitizeSignalText(input.question, 400).text,
     category: String(input.category),
@@ -292,7 +276,7 @@ export function buildForecastPrompt(input: ForecastInput): {
     daysToClose,
     resolutionSource: input.resolutionSource ? sanitizeSignalText(input.resolutionSource, 80).text : 'unspecified',
     questionDocBlock: doc ? `QUESTION DOCUMENT (pinned, hash-verified):\n${doc}` : 'QUESTION DOCUMENT: none available.',
-    signalsBlock: clean.length > 0 ? renderUntrustedBlock(clean, 'untrusted_signals') : '(no relevant signals)',
+    signalsBlock: clean.length > 0 ? renderUntrustedBlock(clean, 'untrusted_signals', fixedNonce) : '(no relevant signals)',
   });
   return { system, user, citations, sent, quarantinedIds };
 }
@@ -321,26 +305,27 @@ export class ForecastSession {
   }
 }
 
+export interface LlmForecasterOptions {
+  prompt?: PromptDef<ForecastVars>;
+  promptVersion?: number;
+}
+
 /**
  * The LLM estimator. With FORECAST_LLM_SAMPLES > 1 it takes the median p and
  * adds the samples' spread to the variance; σ = (p_high_50 − p_low_50) / 1.349.
  * Returns null when no sample succeeded (budget, cap or provider failure).
  */
-export function llmForecaster(session: ForecastSession, samples: number = config.FORECAST_LLM_SAMPLES): Forecaster {
+export function llmForecaster(
+  session: ForecastSession,
+  samples: number = config.FORECAST_LLM_SAMPLES,
+  options: LlmForecasterOptions = {},
+): Forecaster {
+  const promptDef = options.prompt ?? (options.promptVersion !== undefined ? getPrompt('forecast', options.promptVersion) : forecastV1);
   return {
     name: 'llm',
     async forecast(input) {
-      const { system, user, citations, sent, quarantinedIds } = buildForecastPrompt(input);
-      const signalHashes = sent.map((s) => sha256Hex(`${s.promptId}:${s.signalId ?? ''}:${s.source}`).slice(0, 16));
-      const allProvenance: LlmProvenance[] = [];
-      const accepted: Array<{
-        value: LlmForecastOutput;
-        model: string;
-        provenance: LlmProvenance;
-        rejectedAdjustments: RejectedAdjustment[];
-        citedSignalIds: string[];
-      }> = [];
-
+      const { system, user, citations } = buildForecastPrompt(input, promptDef);
+      const outputs: Array<{ value: LlmForecastOutput; model: string; provenance: LlmProvenance }> = [];
       for (let i = 0; i < samples; i++) {
         if (!session.takeLlmCall()) {
           logger.info({ marketId: input.marketId, llmCalls: session.llmCalls }, 'Forecast LLM call cap reached for this cycle');
@@ -351,7 +336,7 @@ export function llmForecaster(session: ForecastSession, samples: number = config
             maxTokens: 1500,
             ctx: { purpose: 'forecast', priority: 'cron' },
             task: 'forecasting',
-            prompt: { id: forecastV2.id, version: forecastV2.version, hash: forecastV2.contentHash },
+            prompt: { id: promptDef.id, version: promptDef.version, hash: promptDef.contentHash },
           });
 
           // Output-side citation validation and deterministic remediation (#304).
@@ -445,7 +430,7 @@ export function llmForecaster(session: ForecastSession, samples: number = config
         sigma,
         rationale: first.value.rationale,
         inputsDigest: sha256Hex(canonicalJson({
-          prompt: { id: forecastV2.id, version: forecastV2.version, hash: forecastV2.contentHash },
+          prompt: { id: promptDef.id, version: promptDef.version, hash: promptDef.contentHash },
           input: forecastInputDigest(input),
         })),
         detail: {
@@ -470,7 +455,7 @@ export function llmForecaster(session: ForecastSession, samples: number = config
 
 // ─── Base-rate forecaster ─────────────────────────────────────────────────────
 
-interface BaseRateEntry {
+export interface BaseRateEntry {
   id: string;
   category: string | null;
   pattern: string;
@@ -480,28 +465,37 @@ interface BaseRateEntry {
   source: string;
 }
 
-const BASE_RATES = (baseRateTable as { version: number; entries: BaseRateEntry[] });
-const COMPILED = BASE_RATES.entries.map((e) => ({ ...e, re: new RegExp(e.pattern, 'i') }));
+export interface BaseRateTable {
+  version: number;
+  entries: BaseRateEntry[];
+}
+
+const BASE_RATES = baseRateTable as BaseRateTable;
 export const UNINFORMATIVE = { p: 0.5, sigma: 0.25 } as const;
 
-export const baseRateForecaster: Forecaster = {
-  name: 'base_rate',
-  async forecast(input) {
-    const entry = COMPILED.find((e) => (e.category === null || e.category === input.category) && e.re.test(input.question));
-    const digest = sha256Hex(canonicalJson({ table: BASE_RATES.version, entry: entry?.id ?? null, question: input.question, category: input.category }));
-    if (!entry) {
-      return { model: `base_rate:v${BASE_RATES.version}`, ...UNINFORMATIVE, rationale: 'No matching reference class; uninformative prior.', inputsDigest: digest, detail: { entry: null } };
-    }
-    return {
-      model: `base_rate:v${BASE_RATES.version}`,
-      p: entry.p,
-      sigma: entry.sigma,
-      rationale: entry.basis,
-      inputsDigest: digest,
-      detail: { entry: entry.id, source: entry.source },
-    };
-  },
-};
+export function createBaseRateForecaster(table: BaseRateTable = BASE_RATES): Forecaster {
+  const compiled = table.entries.map((e) => ({ ...e, re: new RegExp(e.pattern, 'i') }));
+  return {
+    name: 'base_rate',
+    async forecast(input) {
+      const entry = compiled.find((e) => (e.category === null || e.category === input.category) && e.re.test(input.question));
+      const digest = sha256Hex(canonicalJson({ table: table.version, entry: entry?.id ?? null, question: input.question, category: input.category }));
+      if (!entry) {
+        return { model: `base_rate:v${table.version}`, ...UNINFORMATIVE, rationale: 'No matching reference class; uninformative prior.', inputsDigest: digest, detail: { entry: null } };
+      }
+      return {
+        model: `base_rate:v${table.version}`,
+        p: entry.p,
+        sigma: entry.sigma,
+        rationale: entry.basis,
+        inputsDigest: digest,
+        detail: { entry: entry.id, source: entry.source },
+      };
+    },
+  };
+}
+
+export const baseRateForecaster: Forecaster = createBaseRateForecaster(BASE_RATES);
 
 // ─── Cache ────────────────────────────────────────────────────────────────────
 

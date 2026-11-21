@@ -31,7 +31,9 @@
     "gen:schemas": "tsx scripts/gen-schemas.ts",
     "check:schemas": "tsx scripts/gen-schemas.ts --check",
     "check:config": "tsx scripts/check-config-usage.ts",
-    "weights:estimate": "tsx scripts/estimate-source-weights.ts"
+    "weights:estimate": "tsx scripts/estimate-source-weights.ts",
+    "eval:markets": "tsx scripts/eval-markets.ts",
+    "eval:forecast": "tsx scripts/eval-forecast.ts"
   },
   "keywords": [],
   "author": "",

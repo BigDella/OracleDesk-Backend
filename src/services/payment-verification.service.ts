@@ -563,10 +563,25 @@ export function evaluateTransfer(
   };
 }
 
-export async function verifyUsdcTransfer(
-  expected: ExpectedTransfer,
-  signal?: AbortSignal,
-): Promise<VerifiedTransfer> {
-  const facts = await getTxFacts(expected.txHash, { signal });
-  return evaluateTransfer(facts, expected);
+/**
+ * Deterministically orders and selects the transfer events consumed by a
+ * settlement. Events are sorted by `(opIndex ?? 0, eventIndex)` so every
+ * channel claims the exact same canonical subset.
+ */
+export function selectClaimableTransfers(
+  transfer: Pick<VerifiedTransfer, 'transfers'>,
+  requiredAmount?: bigint,
+): SacTransfer[] {
+  const sorted = [...transfer.transfers].sort(
+    (a, b) => (a.opIndex ?? 0) - (b.opIndex ?? 0) || (a.eventIndex ?? 0) - (b.eventIndex ?? 0),
+  );
+  if (requiredAmount === undefined) return sorted;
+  const selected: SacTransfer[] = [];
+  let sum = 0n;
+  for (const t of sorted) {
+    selected.push(t);
+    sum += t.amount;
+    if (sum >= requiredAmount) break;
+  }
+  return selected;
 }

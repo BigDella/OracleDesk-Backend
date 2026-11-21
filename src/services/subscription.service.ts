@@ -12,7 +12,9 @@ import { logger } from '../lib/logger';
 import { config } from '../config';
 import { CONTRACTS, PAYMENTS_RECIPIENT } from '../config/contracts';
 import { decimalToBigint, formatUsdc, toDisplayUsdc } from '../lib/amounts';
-import { verifyUsdcTransfer } from './payment-verification.service';
+import { selectClaimableTransfers, verifyUsdcTransfer } from './payment-verification.service';
+import { claimTransferEvents } from './payment-claims.service';
+import { issueReceiptInTx } from './receipt.service';
 import { AppError } from '../middlewares/error.middleware';
 import type { SubscriptionAccess } from '../types';
 import { summarizeProvenance } from '../lib/llm/provenance';
@@ -670,6 +672,35 @@ export async function settleVerifiedTransfer(
     },
   });
 
+  if ((tx as any).paymentClaim?.create) {
+    const claimedEvents = selectClaimableTransfers(transfer);
+    await claimTransferEvents(tx, {
+      txHash,
+      channel: paymentIntentId ? 'PAYMENT_INTENT' : 'LEGACY_UNLOCK',
+      userId,
+      paymentEventId: paymentEvent.id,
+      totalAmountRaw: amountRaw,
+      transfers: claimedEvents,
+    });
+  }
+
+  let receiptId: string | undefined;
+  if ((tx as any).receipt?.create) {
+    const issued = await issueReceiptInTx(tx, {
+      userId,
+      subscriptionId: created.id,
+      paymentEventId: paymentEvent.id,
+      type,
+      traceId: traceId ?? null,
+      transfer,
+      startsAt,
+      endsAt,
+      ledgerCloseAt,
+      issuedAt: now,
+    });
+    receiptId = issued.receiptId;
+  }
+
   return {
     subscription: created,
     paymentEventId: paymentEvent.id,
@@ -677,6 +708,7 @@ export async function settleVerifiedTransfer(
     perTraceExceeded: allowance.perTraceExceeded,
     ledgerCloseAt,
     granted,
+    ...(receiptId ? { receiptId } : {}),
   };
 }
 

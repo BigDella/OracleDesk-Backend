@@ -188,6 +188,10 @@ export const envObjectSchema = z
     // JWT_SECRET, AUTH_SIGNING_SECRET or a wallet key. Format documented in
     // docs/contract-requests.md; a missing key in production stops boot.
     ENTITLEMENT_SIGNING_KEY: optionalString,
+    // Dedicated Ed25519 key for signing purchase receipts (#313); never reused.
+    RECEIPT_SIGNING_KEY: optionalString,
+    RECEIPT_PREVIOUS_PUBLIC_KEYS: commaList(z.string()),
+    DAILY_PASS_PRICE_VERSION: z.string().default('v1'),
     // Dedicated Ed25519 key for signing SEP-7 URI requests (#270); never reused.
     URI_REQUEST_SIGNING_SECRET: optionalString,
     // Dedicated Ed25519 key for signing reasoning traces (#273); never reused.
@@ -1308,6 +1312,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     // Generated, never printed. Dev/test only: tokens stop verifying on restart.
     data.ENTITLEMENT_SIGNING_KEY = generateEntitlementKey();
     ephemeralSecrets.push('ENTITLEMENT_SIGNING_KEY');
+  }
+  if (!data.RECEIPT_SIGNING_KEY && data.NODE_ENV !== 'production') {
+    data.RECEIPT_SIGNING_KEY = generateEntitlementKey();
+    ephemeralSecrets.push('RECEIPT_SIGNING_KEY');
   }
   if (!data.AUTH_WEB_AUTH_DOMAIN) data.AUTH_WEB_AUTH_DOMAIN = data.AUTH_HOME_DOMAIN;
   if (!data.SEP7_ORIGIN_DOMAIN) data.SEP7_ORIGIN_DOMAIN = data.AUTH_HOME_DOMAIN;

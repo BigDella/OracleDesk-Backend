@@ -1142,6 +1142,62 @@ model PaymentEvent {
   @@map("payment_events")
 }
 
+enum PaymentClaimChannel {
+  LEGACY_UNLOCK
+  PAYMENT_INTENT
+  X402_SETTLEMENT
+  REFUND
+  BACKFILL
+}
+
+model PaymentClaim {
+  id                   String              @id @default(uuid())
+  txHash               String
+  opIndex              Int                 @default(0)
+  eventIndex           Int                 @default(0)
+  channel              PaymentClaimChannel
+  userId               String?
+  amountRaw            String
+  paymentEventId       String?
+  x402SettlementTxHash String?
+  createdAt            DateTime            @default(now()) @db.Timestamptz(3)
+
+  @@unique([txHash, opIndex, eventIndex])
+  @@index([txHash])
+  @@index([userId])
+  @@map("payment_claims")
+}
+
+/// Signed, verifiable purchase receipt (#313)
+model Receipt {
+  id             String             @id @default(uuid())
+  receiptId      String             @unique
+  version        Int                @default(1)
+  userId         String
+  subscriptionId String?            @unique
+  paymentEventId String?            @unique
+  type           SubscriptionType
+  traceId        String?
+  txHash         String
+  ledger         Int
+  payer          String
+  recipient      String
+  amountRaw      String
+  currency       SettlementCurrency @default(USDC)
+  priceVersion   String
+  keyId          String
+  document       Json
+  jws            String
+  redeemedAt     DateTime?          @db.Timestamptz(3)
+  createdAt      DateTime           @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([txHash])
+  @@map("receipts")
+}
+
 // User-defined spending approvals for nanopayment trace access
 model SpendingAllowance {
   id            String             @id @default(uuid())
