@@ -24,9 +24,7 @@ import { logger } from '../lib/logger';
 import { agentClients, agentSigner, readClients, rpcServer } from './stellar/clients';
 import { ChainError, ChainPendingError, TransactionError, contractErrorName, ArchivedEntryError } from './stellar/errors';
 import {
-  beginWriteIntentForRow,
-  endWriteIntentForRow,
-  onConfirmed,
+  completeOutboxRow,
   parseReturnValue,
   prismaOutboxStore,
   runCompletionHandler,
@@ -42,8 +40,15 @@ import {
   type RetryOptions,
 } from './stellar/failures';
 import { withTimeout, TimeoutError, sleep } from '../lib/resilience';
-import { withCallerClass } from '../lib/context';
-import type { Category, Config as MarketCoreConfig, Market as OnChainMarket, Outcome, Position } from '../generated/market-core';
+import type {
+  BandState,
+  BreakerConfig,
+  Category,
+  Config as MarketCoreConfig,
+  Market as OnChainMarket,
+  Outcome,
+  Position,
+} from '../generated/market-core';
 import type { Trace } from '../generated/reasoning-registry';
 import type { DailyUsage, RiskConfig } from '../generated/treasury';
 import type { PriceConfig, ResolutionState, SignerConfig } from '../generated/resolver';
@@ -1055,33 +1060,43 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
   const chainValue = parseReturnValue({ contract, method }, (confirmedTx as any)?.returnValue);
   const value = (chainValue ?? simulatedValueFromSent<T>(contract, method, c.simulated)) as T;
 
-  const confirmedLedger = (confirmedTx as any)?.ledger ?? null;
-  const successRow = await store
-    .transition(outboxRow.id, ['SUBMITTED', 'PENDING'], 'SUCCESS', {
+  const invalidateCache = () => {
+    try {
+      const cache = getChainCache();
+      if (method === 'agent_create_market') {
+        cache.invalidateTag('treasury:capital').catch(() => {});
+      } else if (method === 'agent_buy' || method === 'agent_sell') {
+        const mId = args.market_id !== undefined ? String(args.market_id) : null;
+        if (mId) cache.invalidateTag(`market:${mId}`).catch(() => {});
+        cache.invalidateTag('treasury:capital').catch(() => {});
+      }
+    } catch {}
+  };
+
+  const successRow = await completeOutboxRow(
+    outboxRow,
+    { status: 'SUCCESS', value, txHash: finalHash },
+    {
+      transition: {
+        from: ['SUBMITTED', 'PENDING'],
+        to: 'SUCCESS',
+        patch: {
+          landedHash: finalHash,
+          ledger: (confirmedTx as any)?.ledger ?? null,
+          returnValue: printable(value) as object,
+        },
+      },
       landedHash: finalHash,
-      ledger: confirmedLedger,
-      returnValue: printable(value) as object,
-    })
-    .catch(() => null);
+      afterCommit: invalidateCache,
+    },
+  ).catch((err) => {
+    logger.error({ err, outboxId: outboxRow.id, kind: outboxRow.kind }, 'completion handler failed; recovery will retry');
+    // Still invalidate cache if the row itself was already committed elsewhere.
+    invalidateCache();
+    return null;
+  });
   if (successRow) {
     outboxRow = successRow;
-    // The completion handler + cache invalidation have run by the time write()
-    // resolves (#35, #330). Idempotent: a crash here is re-run by recovery.
-    await runCompletionHandler(successRow, {
-      status: 'SUCCESS',
-      value,
-      txHash: finalHash,
-      ledger: confirmedLedger,
-    }).catch((err) =>
-      logger.error({ err, outboxId: successRow.id, kind: successRow.kind }, 'completion handler failed; recovery will retry'),
-    );
-  } else {
-    await onConfirmed({ ...outboxRow, landedHash: finalHash, ledger: confirmedLedger }, {
-      status: 'SUCCESS',
-      value,
-      txHash: finalHash,
-      ledger: confirmedLedger,
-    });
   }
 
   logger.info({ method, txHash: finalHash, outboxId: outboxRow.id }, 'submitted and confirmed');
@@ -1171,6 +1186,35 @@ const getPositionImpl = (marketId: bigint, holder: string, signal?: AbortSignal)
   read<Position>('marketCore', 'get_position', async () =>
     readClients.marketCore().get_position({ market_id: marketId, holder }), signal,
   );
+
+const getMarketTwapImpl = (marketId: bigint, windowSecs: bigint, signal?: AbortSignal) =>
+  read<number>('marketCore', 'twap', async () =>
+    readClients.marketCore().twap({ market_id: marketId, window_secs: windowSecs }), signal,
+  );
+
+const observeMarketPriceImpl = (marketId: bigint, secondsAgo: bigint, signal?: AbortSignal) =>
+  read<bigint>('marketCore', 'observe', async () =>
+    readClients.marketCore().observe({ market_id: marketId, seconds_ago: secondsAgo }), signal,
+  );
+
+const wouldTripBreakerImpl = (marketId: bigint, outcome: Outcome, collateralIn: bigint, signal?: AbortSignal) =>
+  read<boolean>('marketCore', 'would_trip', async () =>
+    readClients.marketCore().would_trip({ market_id: marketId, outcome, collateral_in: collateralIn }), signal,
+  );
+
+const getBreakerConfigImpl = async (marketId: bigint, signal?: AbortSignal): Promise<BreakerConfig | null> => {
+  const res = await read<BreakerConfig | undefined>('marketCore', 'breaker_config', async () =>
+    readClients.marketCore().breaker_config({ market_id: marketId }), signal,
+  );
+  return res ?? null;
+};
+
+const getBreakerStateImpl = async (marketId: bigint, signal?: AbortSignal): Promise<BandState | null> => {
+  const res = await read<BandState | undefined>('marketCore', 'breaker_state', async () =>
+    readClients.marketCore().breaker_state({ market_id: marketId }), signal,
+  );
+  return res ?? null;
+};
 
 /**
  * get_position plus the ledger the simulation ran against, so the money audit
@@ -1646,6 +1690,11 @@ const IMPLS = {
   getPrice: getPriceImpl,
   quoteBuy: quoteBuyImpl,
   quoteSell: quoteSellImpl,
+  getMarketTwap: getMarketTwapImpl,
+  observeMarketPrice: observeMarketPriceImpl,
+  wouldTripBreaker: wouldTripBreakerImpl,
+  getBreakerConfig: getBreakerConfigImpl,
+  getBreakerState: getBreakerStateImpl,
   treasuryAvailableCapital: treasuryAvailableCapitalImpl,
   treasuryRiskConfig: treasuryRiskConfigImpl,
   treasuryDailyUsage: treasuryDailyUsageImpl,
@@ -1688,6 +1737,11 @@ export const getOnChainMarket = overridable('getOnChainMarket');
 export const getPrice = overridable('getPrice');
 export const quoteBuy = overridable('quoteBuy');
 export const quoteSell = overridable('quoteSell');
+export const getMarketTwap = overridable('getMarketTwap');
+export const observeMarketPrice = overridable('observeMarketPrice');
+export const wouldTripBreaker = overridable('wouldTripBreaker');
+export const getBreakerConfig = overridable('getBreakerConfig');
+export const getBreakerState = overridable('getBreakerState');
 export const treasuryAvailableCapital = overridable('treasuryAvailableCapital');
 export const treasuryRiskConfig = overridable('treasuryRiskConfig');
 export const treasuryDailyUsage = overridable('treasuryDailyUsage');

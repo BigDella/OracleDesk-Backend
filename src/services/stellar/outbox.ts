@@ -24,6 +24,7 @@
  * handlers only fire for rows no caller is waiting on.
  */
 import { Keypair, Transaction, TransactionBuilder, rpc } from '@stellar/stellar-sdk';
+import type { Prisma } from '@prisma/client';
 import { config } from '../../config';
 import { getChainCache } from '../../lib/chain-cache';
 import { logger } from '../../lib/logger';
@@ -109,8 +110,10 @@ const outbox = () => (prisma as unknown as {
   };
 }).chainTransaction;
 
+const PRISMA_STORES = new WeakSet<OutboxStore>();
+
 export function prismaOutboxStore(): OutboxStore {
-  return {
+  const store: OutboxStore = {
     async create(data) {
       return outbox().create({ data });
     },
@@ -169,6 +172,8 @@ export function prismaOutboxStore(): OutboxStore {
       await outbox().updateMany({ where: { id }, data: { error } });
     },
   };
+  PRISMA_STORES.add(store);
+  return store;
 }
 
 // ─── Completion handlers ─────────────────────────────────────────────────────
@@ -182,98 +187,18 @@ export interface CompletionOutcome {
   error?: string | null;
 }
 
-// ─── Write intents & confirmation invalidation (#330) ────────────────────────
-
-const WRITE_INTENT_MARGIN_MS = 15_000;
-const rowIntents = new Map<string, string>();
-
-/** TTL for write intents: inline wait window plus a safety margin. */
-export function writeIntentTtlMs(): number {
-  return config.OUTBOX_INLINE_WAIT_MS + WRITE_INTENT_MARGIN_MS;
+export interface CompletionContext {
+  /** Postgres transaction client; handlers must use this instead of global prisma. */
+  tx: Prisma.TransactionClient;
+  /** Runs only after the completion transaction commits (notifications, cache invalidation). */
+  afterCommit(fn: () => Promise<void> | void): void;
 }
 
-function rowArgsObject(args: unknown): Record<string, unknown> {
-  return args && typeof args === 'object' && !Array.isArray(args)
-    ? (args as Record<string, unknown>)
-    : {};
-}
-
-/**
- * Registers a chain-cache write intent for an outbox row once its envelope is
- * signed and before sendTransaction. Returns the intent token, or null when the
- * write affects no cached tags.
- */
-export async function beginWriteIntentForRow(
-  rowId: string,
-  method: string,
-  args: Record<string, unknown>,
-  ttlMs = writeIntentTtlMs(),
-): Promise<string | null> {
-  const tags = tagsForWrite(method, args);
-  if (tags.length === 0) return null;
-  await endWriteIntentForRow(rowId);
-  try {
-    const token = await getChainCache().beginWrite(tags, ttlMs);
-    rowIntents.set(rowId, token);
-    return token;
-  } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : err, rowId, method }, 'outbox: failed to begin write intent');
-    return null;
-  }
-}
-
-/** Ends any active write intent tracked for an outbox row. Idempotent. */
-export async function endWriteIntentForRow(rowId: string): Promise<void> {
-  const token = rowIntents.get(rowId);
-  if (!token) return;
-  rowIntents.delete(rowId);
-  try {
-    await getChainCache().endWrite(token);
-  } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : err, rowId }, 'outbox: failed to end write intent');
-  }
-}
-
-/** Extends the write intent while a row remains PENDING during recovery. */
-async function refreshWriteIntentForRow(row: ChainTransactionRow): Promise<void> {
-  if (!row.method) return;
-  await beginWriteIntentForRow(row.id, row.method, rowArgsObject(row.args));
-}
-
-/**
- * Confirmation hook (#330): invalidates every chain-read cache tag affected by
- * a confirmed write at its landing ledger, then clears the row's write intent.
- *
- * Called for SUCCESS and for FAILED transactions that landed on-chain with a
- * txHash (a failed transaction still consumed fees and may have altered state
- * via a fee-bump). Runs before `markHandled`, so a crash re-runs it safely.
- */
-export async function onConfirmed(row: ChainTransactionRow, outcome: CompletionOutcome): Promise<void> {
-  const shouldInvalidate =
-    outcome.status === 'SUCCESS' ||
-    (outcome.status === 'FAILED' && Boolean(outcome.txHash ?? row.landedHash));
-
-  try {
-    if (shouldInvalidate && row.method) {
-      const returned = outcome.status === 'SUCCESS' ? (outcome.value ?? row.returnValue) : undefined;
-      const tags = tagsForWrite(row.method, rowArgsObject(row.args), returned);
-      const rawLedger = row.ledger ?? outcome.ledger;
-      const atLedger = typeof rawLedger === 'number' && Number.isFinite(rawLedger) && rawLedger > 0
-        ? rawLedger
-        : undefined;
-      if (tags.length > 0) {
-        const cache = getChainCache();
-        await Promise.all(tags.map((tag) => cache.invalidateTag(tag, atLedger)));
-      }
-    }
-  } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : err, outboxId: row.id, method: row.method }, 'outbox: cache invalidation failed');
-  } finally {
-    await endWriteIntentForRow(row.id);
-  }
-}
-
-export type CompletionHandler = (row: ChainTransactionRow, outcome: CompletionOutcome) => Promise<void>;
+export type CompletionHandler = (
+  row: ChainTransactionRow,
+  outcome: CompletionOutcome,
+  ctx: CompletionContext,
+) => Promise<void>;
 
 const handlers = new Map<string, CompletionHandler>();
 
@@ -285,28 +210,143 @@ export function registerHandler(kind: string, handler: CompletionHandler): void 
   handlers.set(kind, handler);
 }
 
+export interface CompleteOutboxOptions {
+  /** Optional terminal transition to apply inside the same transaction as the handler. */
+  transition?: {
+    from?: OutboxStatus[];
+    to: 'SUCCESS' | 'FAILED' | 'EXPIRED';
+    patch?: Partial<ChainTransactionRow>;
+  };
+  /** Optional landed hash to record on the domain row inside the transaction. */
+  landedHash?: string | null;
+  /** Non-DB side effects to run after the transaction commits. */
+  afterCommit?: () => Promise<void> | void;
+  /** Custom OutboxStore (for unit tests with in-memory stores). */
+  store?: OutboxStore;
+}
+
+async function runPostCommitHooks(hooks: Array<() => Promise<void> | void>): Promise<void> {
+  for (const fn of hooks) {
+    try {
+      await fn();
+    } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : err }, 'outbox: afterCommit hook failed');
+    }
+  }
+}
+
 /**
- * Runs the kind's handler, invalidates affected chain-cache tags, then marks
- * the row handled. Running handler + invalidation before the mark guarantees
- * a crash in between re-runs both idempotently.
+ * Runs a terminal transition (optional), landed-hash bookkeeping, the
+ * registered completion handler, and `handledAt` in ONE Postgres transaction
+ * starting with `SELECT ... FOR UPDATE` on `chain_transactions` (#290).
+ * Non-DB side effects registered via `afterCommit` run only after commit.
+ */
+export async function completeOutboxRow(
+  rowOrId: ChainTransactionRow | string,
+  outcome: CompletionOutcome,
+  opts: CompleteOutboxOptions = {},
+): Promise<ChainTransactionRow | null> {
+  const rowId = typeof rowOrId === 'string' ? rowOrId : rowOrId.id;
+  const hooks: Array<() => Promise<void> | void> = [];
+  if (opts.afterCommit) hooks.push(opts.afterCommit);
+
+  // In-memory OutboxStore path for unit tests that don't use Postgres.
+  if (opts.store && !PRISMA_STORES.has(opts.store)) {
+    let row = typeof rowOrId === 'string' ? await opts.store.findById(rowId) : rowOrId;
+    if (!row) return null;
+    if (opts.transition) {
+      const from = opts.transition.from ?? [...IN_FLIGHT];
+      const moved = await opts.store.transition(row.id, from, opts.transition.to, opts.transition.patch);
+      if (!moved) return null;
+      row = moved;
+    }
+    if (!row.handledAt) {
+      await trackHandlerRun(row.kind, async () => {
+        const handler = handlers.get(row.kind);
+        if (!handler && DOMAIN_KINDS.has(row.kind)) {
+          throw new Error(`no completion handler registered for ${row.kind}`);
+        }
+        const noopCtx: CompletionContext = {
+          tx: prisma as unknown as Prisma.TransactionClient,
+          afterCommit: (fn) => { hooks.push(fn); },
+        };
+        if (handler) await handler(row!, outcome, noopCtx);
+        await opts.store!.markHandled(row!.id);
+      });
+    }
+    await runPostCommitHooks(hooks);
+    return row;
+  }
+
+  const kindHint = typeof rowOrId === 'string' ? 'unknown' : rowOrId.kind;
+  const committed = await trackHandlerRun(kindHint, async () => {
+    return prisma.$transaction(async (tx) => {
+      const rows = await tx.$queryRaw<ChainTransactionRow[]>`
+        SELECT * FROM "chain_transactions" WHERE "id" = ${rowId} FOR UPDATE`;
+      let locked = rows[0] ?? null;
+      if (!locked) return null;
+      if (locked.handledAt) return locked;
+
+      let effectiveOutcome = outcome;
+      if (opts.transition) {
+        const from = opts.transition.from ?? [...IN_FLIGHT];
+        if (from.includes(locked.status as OutboxStatus)) {
+          locked = await (tx as unknown as { chainTransaction: { update(a: unknown): Promise<ChainTransactionRow> } })
+            .chainTransaction.update({
+              where: { id: locked.id },
+              data: { status: opts.transition.to, ...(opts.transition.patch ?? {}) },
+            });
+        } else if (TERMINAL_STATUSES.includes(locked.status as OutboxStatus)) {
+          // Another path already transitioned the row to terminal but crashed
+          // before marking handled; finish the handler with stored outcome.
+          effectiveOutcome = completionOutcomeFor(locked);
+        } else {
+          return null;
+        }
+      }
+
+      if (opts.landedHash) {
+        await applyLandedHash(locked, opts.landedHash, tx);
+      }
+
+      const handler = handlers.get(locked.kind);
+      if (!handler && DOMAIN_KINDS.has(locked.kind)) {
+        throw new Error(`no completion handler registered for ${locked.kind}`);
+      }
+      if (handler) {
+        await handler(locked, effectiveOutcome, {
+          tx,
+          afterCommit: (fn) => { hooks.push(fn); },
+        });
+      }
+
+      locked = await (tx as unknown as { chainTransaction: { update(a: unknown): Promise<ChainTransactionRow> } })
+        .chainTransaction.update({
+          where: { id: locked.id },
+          data: { handledAt: new Date() },
+        });
+
+      return locked;
+    });
+  });
+
+  if (committed) {
+    await runPostCommitHooks(hooks);
+  }
+  return committed;
+}
+
+/**
+ * Runs the kind's handler and marks the row handled atomically in one
+ * Postgres transaction with `SELECT ... FOR UPDATE` (#290).
  */
 export async function runCompletionHandler(
   row: ChainTransactionRow,
   outcome: CompletionOutcome,
-  store: OutboxStore = prismaOutboxStore(),
+  store?: OutboxStore,
 ): Promise<void> {
   if (row.handledAt) return;
-  await trackHandlerRun(row.kind, async () => {
-    const handler = handlers.get(row.kind);
-    if (!handler && DOMAIN_KINDS.has(row.kind)) {
-      // The owning module has not loaded (or failed to): leaving the row
-      // unhandled keeps it visible to the next recovery pass instead of
-      // silently dropping the domain update.
-      throw new Error(`no completion handler registered for ${row.kind}`);
-    }
-    if (handler) await handler(row, outcome);
-    await store.markHandled(row.id);
-  });
+  await completeOutboxRow(row, outcome, store ? { store } : {});
 }
 
 // ─── Handler failure streaks (#220) ──────────────────────────────────────────
@@ -428,22 +468,22 @@ export async function innerHashForTx(txHash: string): Promise<string | null> {
  * After a bump lands, the domain row must store the hash that actually appears
  * on chain (outer) plus the inner hash for reference (#38).
  */
-async function applyLandedHash(row: ChainTransactionRow, landedHash: string): Promise<void> {
-  const db = prisma as unknown as {
+async function applyLandedHash(
+  row: ChainTransactionRow,
+  landedHash: string,
+  tx: Prisma.TransactionClient | typeof prisma = prisma,
+): Promise<void> {
+  const db = tx as unknown as {
     trade: { updateMany(args: unknown): Promise<unknown> };
     market: { updateMany(args: unknown): Promise<unknown> };
     reasoningTrace: { updateMany(args: unknown): Promise<unknown> };
   };
-  try {
-    if ((row.kind === 'trade' || row.kind === 'trade.buy') && row.refId) {
-      await db.trade.updateMany({ where: { id: row.refId }, data: { txHash: landedHash, innerTxHash: row.hash } });
-    } else if ((row.kind === 'market' || row.kind === 'market.create') && row.refId) {
-      await db.market.updateMany({ where: { id: row.refId }, data: { creationTxHash: landedHash, creationInnerTxHash: row.hash } });
-    } else if ((row.kind === 'trace' || row.kind === 'trace.publish') && row.refId) {
-      await db.reasoningTrace.updateMany({ where: { id: row.refId }, data: { publishTxHash: landedHash, publishInnerTxHash: row.hash } });
-    }
-  } catch (err) {
-    logger.warn({ err, hash: row.hash, landedHash }, 'outbox: could not record the landed hash on the domain row');
+  if ((row.kind === 'trade' || row.kind === 'trade.buy') && row.refId) {
+    await db.trade.updateMany({ where: { id: row.refId }, data: { txHash: landedHash, innerTxHash: row.hash } });
+  } else if ((row.kind === 'market' || row.kind === 'market.create') && row.refId) {
+    await db.market.updateMany({ where: { id: row.refId }, data: { creationTxHash: landedHash, creationInnerTxHash: row.hash } });
+  } else if ((row.kind === 'trace' || row.kind === 'trace.publish') && row.refId) {
+    await db.reasoningTrace.updateMany({ where: { id: row.refId }, data: { publishTxHash: landedHash, publishInnerTxHash: row.hash } });
   }
 }
 
@@ -626,9 +666,12 @@ export async function recoverRow(
 
   // Crash between create and sign: nothing was signed, nothing can land.
   if (row.status === 'BUILT') {
-    const moved = await store.transition(row.id, ['BUILT'], 'FAILED', { error: 'abandoned before signing' });
+    const moved = await completeOutboxRow(
+      row,
+      { status: 'FAILED', error: 'abandoned before signing' },
+      { transition: { from: ['BUILT'], to: 'FAILED', patch: { error: 'abandoned before signing' } }, store: deps.store },
+    );
     if (moved) {
-      await runCompletionHandler(moved, { status: 'FAILED', error: moved.error }, store);
       stats.resolved++;
       stats.handled++;
     }
@@ -654,34 +697,38 @@ export async function recoverRow(
     const resultXdrB64 = serializeResultXdr(landed.resp);
     if (landed.status === 'SUCCESS') {
       const value = parseReturnValue(row, anyResp.returnValue);
-      const moved = await store.transition(row.id, [...IN_FLIGHT], 'SUCCESS', {
-        landedHash: landed.hash,
-        ledger: anyResp.ledger ?? null,
-        resultXdr: resultXdrB64,
-        returnValue: printableValue(value) ?? undefined,
-      });
-      await recordFeeReceipt(
-        moved ?? row,
-        inferOpClass(moved ?? row),
-        estimateFromRow(moved ?? row),
-        landed.resp,
-        { landedHash: landed.hash },
+      const moved = await completeOutboxRow(
+        row,
+        { status: 'SUCCESS', value, txHash: landed.hash },
+        {
+          transition: {
+            from: [...IN_FLIGHT],
+            to: 'SUCCESS',
+            patch: {
+              landedHash: landed.hash,
+              ledger: anyResp.ledger ?? null,
+              returnValue: printableValue(value) ?? undefined,
+            },
+          },
+          landedHash: landed.hash,
+          store: deps.store,
+        },
       );
       if (moved) {
-        await applyLandedHash(moved, landed.hash);
-        await runCompletionHandler(moved, { status: 'SUCCESS', value, txHash: landed.hash, ledger: anyResp.ledger ?? moved.ledger }, store);
         stats.resolved++;
         stats.handled++;
       }
     } else {
       const error = contractErrorName((row.contract ?? 'treasury') as BindingContract, landed.resp) ?? 'transaction failed on-chain';
-      const moved = await store.transition(row.id, [...IN_FLIGHT], 'FAILED', {
-        landedHash: landed.hash,
-        ledger: anyResp.ledger ?? null,
-        error,
-      });
+      const moved = await completeOutboxRow(
+        row,
+        { status: 'FAILED', error, txHash: landed.hash },
+        {
+          transition: { from: [...IN_FLIGHT], to: 'FAILED', patch: { landedHash: landed.hash, error } },
+          store: deps.store,
+        },
+      );
       if (moved) {
-        await runCompletionHandler(moved, { status: 'FAILED', error, txHash: landed.hash, ledger: anyResp.ledger ?? moved.ledger }, store);
         stats.resolved++;
         stats.handled++;
       }
@@ -700,9 +747,12 @@ export async function recoverRow(
     if (row.status !== 'SIGNED') return stats;
   }
   if (expiry.decision === 'EXPIRED') {
-    const moved = await store.transition(row.id, [...IN_FLIGHT], 'EXPIRED', { error: 'expired by timebounds' });
+    const moved = await completeOutboxRow(
+      row,
+      { status: 'EXPIRED', txHash: row.hash },
+      { transition: { from: [...IN_FLIGHT], to: 'EXPIRED', patch: { error: 'expired by timebounds' } }, store: deps.store },
+    );
     if (moved) {
-      await runCompletionHandler(moved, { status: 'EXPIRED', txHash: row.hash }, store);
       stats.expired++;
       stats.handled++;
     }
@@ -727,9 +777,12 @@ export async function recoverRow(
         stats.resubmitted++;
       } else if (resp.status === 'ERROR') {
         // tx_bad_seq (or any decoded rejection) means this envelope can never land.
-        const moved = await store.transition(row.id, ['SIGNED'], 'FAILED', { error: 'rejected on resubmit' });
+        const moved = await completeOutboxRow(
+          row,
+          { status: 'FAILED', error: 'rejected on resubmit' },
+          { transition: { from: ['SIGNED'], to: 'FAILED', patch: { error: 'rejected on resubmit' } }, store: deps.store },
+        );
         if (moved) {
-          await runCompletionHandler(moved, { status: 'FAILED', error: moved.error }, store);
           stats.handled++;
         }
       }
@@ -751,7 +804,7 @@ export async function recoverRow(
   })) {
     return stats;
   }
-  if (await bumpRow(row, server, feePayerKeypair(deps), store)) stats.bumped++;
+  if (await bumpRow(row, server, feePayerKeypair(deps), store, deps.store !== undefined)) stats.bumped++;
   return stats;
 }
 
@@ -781,7 +834,7 @@ export async function recoverInFlight(deps: RecoverDeps = {}): Promise<RecoveryS
             txHash: row.landedHash ?? row.hash,
             error: row.error,
           },
-          store,
+          deps.store,
         );
         stats.handled++;
       } catch (err) {
@@ -824,6 +877,7 @@ async function bumpRow(
   server: Pick<rpc.Server, 'getTransaction' | 'sendTransaction'>,
   feePayer: Keypair,
   store: OutboxStore,
+  useCustomStore = false,
 ): Promise<boolean> {
   let inner: Transaction;
   try {
@@ -872,30 +926,20 @@ async function bumpRow(
         withTimeout('rpc-confirm', () => server.getTransaction(row.hash!)),
       );
       if (recheck.status === 'SUCCESS' || recheck.status === 'FAILED') {
-        const recheckLedger = (recheck as { ledger?: number }).ledger ?? null;
-        const moved = await store.transition(row.id, [...IN_FLIGHT], recheck.status === 'SUCCESS' ? 'SUCCESS' : 'FAILED', {
-          landedHash: row.hash,
-          ledger: recheckLedger,
-        });
-        await recordFeeReceipt(
-          moved ?? row,
-          inferOpClass(moved ?? row),
-          estimateFromRow(moved ?? row),
-          recheck,
-          { landedHash: row.hash },
-        );
-        if (moved) {
-          await runCompletionHandler(
-            moved,
-            {
-              status: recheck.status,
-              value: recheck.status === 'SUCCESS' ? parseReturnValue(row, (recheck as { returnValue?: unknown }).returnValue) : undefined,
-              txHash: row.hash,
-              ledger: recheckLedger,
+        const value = recheck.status === 'SUCCESS' ? parseReturnValue(row, (recheck as { returnValue?: unknown }).returnValue) : undefined;
+        await completeOutboxRow(
+          row,
+          { status: recheck.status, value, txHash: row.hash },
+          {
+            transition: {
+              from: [...IN_FLIGHT],
+              to: recheck.status === 'SUCCESS' ? 'SUCCESS' : 'FAILED',
+              patch: { landedHash: row.hash },
             },
-            store,
-          );
-        }
+            landedHash: recheck.status === 'SUCCESS' ? row.hash : null,
+            store: useCustomStore ? store : undefined,
+          },
+        );
       }
     }
   } catch (err) {

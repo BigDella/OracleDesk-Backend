@@ -13,7 +13,7 @@ import { verifyTraceHash, sha256Hex } from '../utils/hash.util';
 import { Prisma } from '@prisma/client';
 import { fetchIpfsBytes } from './ipfs.service';
 import { getOnChainTrace, printable } from './chain.service';
-import { registerHandler, type ChainTransactionRow, type CompletionOutcome } from './stellar/outbox';
+import { registerHandler, type ChainTransactionRow, type CompletionContext, type CompletionOutcome } from './stellar/outbox';
 import { processPublication } from '../jobs/trace-publication.worker';
 import type { TraceAction } from '../lib/trace-actions';
 import { fetchVerifiedBytes, pinJson } from './ipfs.service';
@@ -38,11 +38,15 @@ import crypto from 'node:crypto';
  * exactly like the indexer's TracePublished projection. Failures are left to
  * the publication worker's own retry state machine.
  */
-export async function handleTracePublishOutcome(row: ChainTransactionRow, outcome: CompletionOutcome): Promise<void> {
+export async function handleTracePublishOutcome(
+  row: ChainTransactionRow,
+  outcome: CompletionOutcome,
+  ctx: CompletionContext,
+): Promise<void> {
   const traceId = row.refId;
   if (!traceId || outcome.status !== 'SUCCESS') return;
   const onChainTraceId = BigInt(String(outcome.value ?? '0'));
-  await prisma.reasoningTrace.updateMany({
+  await ctx.tx.reasoningTrace.updateMany({
     where: { id: traceId, onChainTraceId: null },
     data: {
       onChainTraceId,
@@ -51,7 +55,7 @@ export async function handleTracePublishOutcome(row: ChainTransactionRow, outcom
       verified: true,
     },
   });
-  await prisma.tracePublication.updateMany({
+  await ctx.tx.tracePublication.updateMany({
     where: { traceId, status: { in: ['AWAITING_MARKET', 'READY', 'SUBMITTED'] } },
     data: { status: 'CONFIRMED', confirmedAt: new Date(), lastError: null },
   });

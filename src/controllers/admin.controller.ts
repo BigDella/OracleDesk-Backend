@@ -23,6 +23,7 @@ import { logger } from '../lib/logger';
 import { config } from '../config';
 import { secret } from '../config/secrets';
 import { chainWritesStatus, health } from '../services/health.service';
+import { socketStreamClusterStats } from '../lib/socket-stream';
 import { indexerStatus } from '../services/indexer.service';
 import { Keypair } from '@stellar/stellar-sdk';
 import { agentSigner } from '../services/stellar/clients';
@@ -339,6 +340,8 @@ export async function getSystemStatus(_req: Request, res: Response): Promise<voi
     },
     // Outbox backlog, handler streaks, signer/channel balances (#220). Public keys only.
     chainWrites: await chainWritesStatus().catch(() => null),
+    // Cluster-wide Socket.io Redis Streams adapter lag & gaps (#293).
+    socketStream: config.EVENT_BUS_ENABLED ? await socketStreamClusterStats().catch(() => null) : null,
     llm: {
       anthropicConfigured: secret('ANTHROPIC_API_KEY') !== '',
       geminiConfigured: secret('GEMINI_API_KEY') !== '',

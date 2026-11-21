@@ -464,6 +464,15 @@ export const envObjectSchema = z
     // Approximate stream cap (XADD MAXLEN ~). chain_events stays the durable history.
     EVENT_BUS_MAXLEN: z.string().default('100000').transform(Number)
       .pipe(z.number().int().min(1000)),
+    // One XREAD batch and its BLOCK duration. The blocking connection disables
+    // ioredis commandTimeout (a 500 ms timeout rejects every idle BLOCK 1000
+    // read); EVENT_BUS_BLOCKING_TIMEOUT_MS is the safety net above the block.
+    EVENT_BUS_READ_COUNT: z.string().default('100').transform(Number)
+      .pipe(z.number().int().min(1).max(1000)),
+    EVENT_BUS_BLOCK_MS: z.string().default('1000').transform(Number)
+      .pipe(z.number().int().min(100).max(30000)),
+    EVENT_BUS_BLOCKING_TIMEOUT_MS: z.string().default('5000').transform(Number)
+      .pipe(z.number().int().min(200).max(60000)),
     // Identifies this process as fan-out leader candidate and in logs.
     INSTANCE_ID: z.string().default('').transform((v) => v.trim() || `${os.hostname()}-${process.pid}`),
 
@@ -725,6 +734,15 @@ export const envObjectSchema = z
     TRADER_MAX_PRICE_DRIFT_BPS: z.string().default('150').transform(Number).pipe(z.number().int().min(0)),
     /** Consecutive stale-price markets that abort the scan cycle with PRICE_SOURCE_DOWN. */
     TRADER_STALE_ABORT_COUNT: z.string().default('3').transform(Number).pipe(z.number().int().min(1)),
+    // ── Market-core TWAP and breakers (#292) ──────────────────────────────
+    /** Window for the manipulation-resistant YES-price TWAP used by risk decisions. */
+    TWAP_WINDOW_SECS: z.string().default('300').transform(Number).pipe(z.number().int().min(30).max(3600)),
+    /** Minimum observations required before a TWAP replaces the spot mark for risk. */
+    TWAP_MIN_OBSERVATIONS: z.string().default('2').transform(Number).pipe(z.number().int().min(1).max(16)),
+    /** Spot/TWAP divergence (bps) above which a spot-only stop is deferred. */
+    TWAP_DIVERGENCE_BPS: z.string().default('500').transform(Number).pipe(z.number().int().min(0).max(5000)),
+    /** Max parts a breaker-limited exit is split into across ledger cycles. */
+    EXIT_BREAKER_MAX_PARTS: z.string().default('4').transform(Number).pipe(z.number().int().min(1).max(20)),
     /** #225 — max ledgers the reserves the trader sizes against may lag the RPC (valuation DEFAULT_MAX_AGE_LEDGERS). */
     TRADER_POOL_MAX_AGE_LEDGERS: z.string().default('120').transform(Number).pipe(z.number().int().min(1)),
     // #147 — development-only local IPFS stub selected explicitly.
@@ -907,10 +925,36 @@ export const envObjectSchema = z
     // ── Socket.io throttling & slow-consumer guard (Issue #96) ─────────────
     SOCKET_PRICE_TICK_MS: z.string().default('1000').transform(Number),
     SOCKET_TRADE_VOLATILE: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
-    SOCKET_LIVE_LEDGER_LAG: z.string().default('12').transform(Number),
+    // A chain event at or above (RPC latest ledger − this) is live; older
+    // events are catch-up and never emitted as live prices (#291).
+    SOCKET_LIVE_LEDGER_LAG: z.string().default('12').transform(Number)
+      .pipe(z.number().int().min(0).max(1000)),
     SOCKET_SLOW_WARN_BYTES: z.string().default('262144').transform(Number),
     SOCKET_SLOW_DROP_BYTES: z.string().default('2097152').transform(Number),
     SOCKET_SLOW_CHECK_MS: z.string().default('2000').transform(Number),
+
+    // ── Redis Streams adapter bounds and observability (#293) ──────────────
+    // Explicit stream cap and batch size, sized against the emit rate and the
+    // tolerated lag instead of the adapter's implicit 10,000 / 100 defaults.
+    SOCKET_STREAM_NAME: z.string().default('oracledesk:socket.io'),
+    SOCKET_ADAPTER_MAXLEN: z.string().default('10000').transform(Number)
+      .pipe(z.number().int().min(100)),
+    SOCKET_ADAPTER_READ_COUNT: z.string().default('100').transform(Number)
+      .pipe(z.number().int().min(1).max(1000)),
+    SOCKET_ADAPTER_BLOCK_MS: z.string().default('1000').transform(Number)
+      .pipe(z.number().int().min(100).max(30000)),
+    SOCKET_ADAPTER_BLOCKING_TIMEOUT_MS: z.string().default('5000').transform(Number)
+      .pipe(z.number().int().min(200).max(60000)),
+    SOCKET_ADAPTER_MONITOR_MS: z.string().default('5000').transform(Number)
+      .pipe(z.number().int().min(500)),
+    // Warn when this instance is this far behind the stream tail.
+    SOCKET_ADAPTER_LAG_WARN_ENTRIES: z.string().default('500').transform(Number)
+      .pipe(z.number().int().min(1)),
+    SOCKET_ADAPTER_LAG_WARN_MS: z.string().default('5000').transform(Number)
+      .pipe(z.number().int().min(100)),
+    // Above this lag, coalescable public traffic is shed (private/admin never).
+    SOCKET_ADAPTER_SHED_LAG_ENTRIES: z.string().default('2000').transform(Number)
+      .pipe(z.number().int().min(1)),
 
     // ── Socket.io hardening & limits (Issue #97) ──────────────────────────
     SOCKET_MAX_CONNECTIONS: z.string().default('5000').transform(Number),

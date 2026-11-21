@@ -37,8 +37,14 @@ export interface ControlHoldRow {
 
 export const CONTROL_SCOPES: readonly ControlScope[] = ['ALL', 'MARKET_MAKER', 'TRADER'];
 
-/** Risk-cap rejections are expected behaviour of the treasury, not failures. */
-const CAP_ERRORS = new Set(['TradeCapExceeded', 'MarketCapExceeded', 'DailyCapExceeded']);
+/** Risk-cap and market-core breaker rejections are expected behaviour, not infra failures (#292). */
+const CAP_ERRORS = new Set([
+  'TradeCapExceeded',
+  'MarketCapExceeded',
+  'DailyCapExceeded',
+  'PriceImpactTooHigh',
+  'PriceBandExceeded',
+]);
 
 export class AgentPausedError extends AppError {
   constructor(scope: AgentScope, details: { reason?: string; until?: Date; source?: string }) {
