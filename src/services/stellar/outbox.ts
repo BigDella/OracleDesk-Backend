@@ -26,6 +26,7 @@
 import { Keypair, Transaction, TransactionBuilder, rpc } from '@stellar/stellar-sdk';
 import type { Prisma } from '@prisma/client';
 import { config } from '../../config';
+import { getChainCache } from '../../lib/chain-cache';
 import { logger } from '../../lib/logger';
 import { prisma } from '../../lib/prisma';
 import { RedisUnavailableError, getRedis, releaseLock, renewLock } from '../../lib/redis';
@@ -45,6 +46,7 @@ export const SIGNED_GRACE_MS = 30_000;
 export interface ChainTransactionRow {
   id: string;
   kind: string;
+  opClass?: string | null;
   refId: string | null;
   contract: string | null;
   method: string | null;
@@ -181,6 +183,7 @@ export interface CompletionOutcome {
   /** Native return value for SUCCESS (e.g. the on-chain market id or shares). */
   value?: unknown;
   txHash?: string | null;
+  ledger?: number | null;
   error?: string | null;
 }
 
@@ -690,7 +693,8 @@ export async function recoverRow(
   }
 
   if (landed) {
-    const anyResp = landed.resp as { ledger?: number; returnValue?: unknown; resultXdr?: { toXDR(enc: string): string } };
+    const anyResp = landed.resp as { ledger?: number; returnValue?: unknown; resultXdr?: string | { toXDR(enc: string): string } };
+    const resultXdrB64 = serializeResultXdr(landed.resp);
     if (landed.status === 'SUCCESS') {
       const value = parseReturnValue(row, anyResp.returnValue);
       const moved = await completeOutboxRow(
@@ -755,12 +759,19 @@ export async function recoverRow(
     return stats;
   }
 
+  // Row is still in-flight: extend its write intent while pending (#330).
+  if (row.status === 'PENDING' || row.status === 'SUBMITTED') {
+    await refreshWriteIntentForRow(row);
+  }
+
   // Crash between sign and send: the stored envelope resubmits byte-for-byte,
   // which is safe (same hash, same sequence; at most one copy can execute).
   if (row.status === 'SIGNED' && row.envelopeXdr) {
     try {
       const signed = TransactionBuilder.fromXDR(row.envelopeXdr, config.STELLAR_NETWORK_PASSPHRASE) as Transaction;
-      const resp = await server.sendTransaction(signed);
+      const resp = await withCallerClass('agent', () =>
+        withTimeout('rpc-write', () => server.sendTransaction(signed)),
+      );
       if (resp.status === 'PENDING' || resp.status === 'DUPLICATE') {
         await store.transition(row.id, ['SIGNED'], 'SUBMITTED', { submitLedger: resp.latestLedger ?? null });
         stats.resubmitted++;
@@ -784,7 +795,9 @@ export async function recoverRow(
 
   // Submitted but not yet visible: fee-bump when stuck past the threshold (#38).
   if (!config.FEE_BUMP_ENABLED) return stats;
-  const latestLedger = deps.ledgerOverride ?? (await server.getLatestLedger()).sequence;
+  const latestLedger =
+    deps.ledgerOverride ??
+    (await withCallerClass('agent', () => withTimeout('rpc-read', () => server.getLatestLedger()))).sequence;
   if (!shouldBump(row, latestLedger, nowSecs, {
     afterLedgers: config.FEE_BUMP_AFTER_LEDGERS,
     maxAttempts: config.FEE_BUMP_MAX_ATTEMPTS,
@@ -851,10 +864,12 @@ export async function recoverInFlight(deps: RecoverDeps = {}): Promise<RecoveryS
  * so a matching non-terminal row resolves without waiting for the poll.
  */
 export async function recoverByTxHash(txHash: string, deps: RecoverDeps = {}): Promise<void> {
-  const store = deps.store ?? prismaOutboxStore();
-  const row = await store.findByAnyHash([txHash]);
-  if (!row || TERMINAL_STATUSES.includes(row.status as OutboxStatus)) return;
-  await recoverRow(row, { ...deps, store });
+  return withCallerClass('agent', async () => {
+    const store = deps.store ?? prismaOutboxStore();
+    const row = await store.findByAnyHash([txHash]);
+    if (!row || TERMINAL_STATUSES.includes(row.status as OutboxStatus)) return;
+    await recoverRow(row, { ...deps, store });
+  });
 }
 
 async function bumpRow(
@@ -902,10 +917,14 @@ async function bumpRow(
 
   // Persisted before sending, as for every submission.
   try {
-    const resp = await server.sendTransaction(outer);
+    const resp = await withCallerClass('agent', () =>
+      withTimeout('rpc-write', () => server.sendTransaction(outer)),
+    );
     if (resp.status === 'ERROR') {
       // Expected after the inner already landed; poll before deciding.
-      const recheck = await server.getTransaction(row.hash!);
+      const recheck = await withCallerClass('agent', () =>
+        withTimeout('rpc-confirm', () => server.getTransaction(row.hash!)),
+      );
       if (recheck.status === 'SUCCESS' || recheck.status === 'FAILED') {
         const value = recheck.status === 'SUCCESS' ? parseReturnValue(row, (recheck as { returnValue?: unknown }).returnValue) : undefined;
         await completeOutboxRow(

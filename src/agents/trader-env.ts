@@ -11,6 +11,10 @@ import { decisionPrice, type DecisionPrice } from '../services/market-price.serv
 import { config } from '../config';
 import { ForecastSession, forecastMarket, rankForForecast, type ForecastMarket } from '../services/forecast.service';
 import { exitPosition } from '../services/exit.service';
+import {
+  evaluatePositionPredicates,
+  type TriggeredPredicateResult,
+} from '../services/hedge-predicate.service';
 import { latestReserves, markOpenPositions, type MarketReserves } from '../services/valuation.service';
 import { getOnChainMarketCached, Outcomes, wouldTripBreaker } from '../services/chain.service';
 import { indexerLag, latestLedgerView, type IndexerLag } from '../services/chain-freshness.service';
@@ -160,6 +164,10 @@ export interface TraderEnv {
   /** Marks open positions to market from the latest reserves (#78); a backtest values its own pools. */
   markToMarket?(): Promise<void>;
   stopLoss(position: PositionView): Promise<{ shouldClose: boolean; reason?: string }>;
+  /** Evaluates active hedge predicates for a position as of `asOf` (#302). */
+  evaluatePredicates?(position: PositionView, asOf: Date, cycleId: string): Promise<TriggeredPredicateResult[]>;
+  /** Re-runs the forecaster on a position's market when a REFORECAST predicate triggers (#302). */
+  reforecast?(position: PositionView, asOf: Date): Promise<{ ok: boolean; probabilityEstimate?: number; reason?: string }>;
   /** `bankroll` is the cycle's free treasury cash in USDC; the correlated-exposure cap is a share of it. */
   correlation(marketId: string, size: number, direction: TradeDirection, bankroll: number): Promise<CorrelationCheckResult>;
   hedges(): Promise<HedgeRecommendation[]>;
@@ -303,6 +311,20 @@ export function prodTraderEnv(): TraderEnv {
 
     stopLoss: (position) => enforceStopLoss(position.id),
 
+    evaluatePredicates: (position, asOf, cycleId) =>
+      evaluatePositionPredicates(position.id, asOf, cycleId),
+
+    async reforecast(position) {
+      const market = await prisma.market.findUnique({ where: { id: position.marketId } });
+      if (!market || !market.question) {
+        return { ok: false, reason: 'MARKET_NOT_FOUND' };
+      }
+      const sigs = await aggregateSignals();
+      const result = await forecastMarket(market as ForecastMarket, sigs, forecastSession);
+      if (!result) return { ok: false, reason: 'FORECAST_UNAVAILABLE' };
+      return { ok: true, probabilityEstimate: result.forecast.p };
+    },
+
     correlation: (marketId, size, direction, bankroll) => checkCorrelation(marketId, size, bankroll, { direction }),
 
     hedges: () => detectHedgeOpportunities(),
@@ -322,6 +344,17 @@ export function prodTraderEnv(): TraderEnv {
           const detail = m.detail as { provenance?: unknown } | undefined;
           return Array.isArray(detail?.provenance) ? (detail!.provenance as ProvenanceEntry[]) : [];
         });
+
+      const citedSourceIds = [
+        ...new Set(
+          (order.forecast.ensemble?.members ?? []).flatMap((m) => {
+            const detail = m.detail as { citedSignalIds?: unknown } | undefined;
+            return Array.isArray(detail?.citedSignalIds)
+              ? (detail!.citedSignalIds.filter((x): x is string => typeof x === 'string'))
+              : [];
+          }),
+        ),
+      ];
 
       // Generate reasoning trace BEFORE executing
       const { trace, tracePayload } = await generateReasoningTrace({

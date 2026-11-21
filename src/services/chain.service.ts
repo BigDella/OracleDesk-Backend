@@ -21,7 +21,7 @@ import type { rpc } from '@stellar/stellar-sdk';
 import { config } from '../config';
 import { CONTRACTS } from '../config/contracts';
 import { logger } from '../lib/logger';
-import { agentClients, agentSigner, readClients } from './stellar/clients';
+import { agentClients, agentSigner, readClients, rpcServer } from './stellar/clients';
 import { ChainError, ChainPendingError, TransactionError, contractErrorName, ArchivedEntryError } from './stellar/errors';
 import {
   completeOutboxRow,
@@ -52,11 +52,11 @@ import type {
 import type { Trace } from '../generated/reasoning-registry';
 import type { DailyUsage, RiskConfig } from '../generated/treasury';
 import type { PriceConfig, ResolutionState, SignerConfig } from '../generated/resolver';
-import { getRedis } from '../lib/redis';
 import {
   chainKey,
+  getChainCache,
   memoryChainCache,
-  redisChainCache,
+  setChainCache,
   type ChainCache,
   type CacheEntry,
 } from '../lib/chain-cache';
@@ -69,11 +69,12 @@ import {
   type AgentScope,
 } from './agent-controls.service';
 
-export { memoryChainCache };
+export { getChainCache, memoryChainCache, setChainCache };
 
-import { Keypair, scValToNative } from '@stellar/stellar-sdk';
+import { Account, Address, Contract, Keypair, TransactionBuilder, scValToNative, xdr } from '@stellar/stellar-sdk';
 import { prisma } from '../lib/prisma';
 import { getFeeOracle, type OperationClass } from './stellar/fees';
+import { recordFeeReceipt, serializeResultXdr } from './stellar/fee-receipt';
 import { timeoutFor, decideExpiry, ExpiredError, type ExpiryDecision, authExpirationLedger } from './stellar/timebounds';
 import {
   getTransactionReader,
@@ -142,23 +143,6 @@ async function crashPoint(p: CrashPoint): Promise<void> {
 }
 
 // ─── Cache Management ───────────────────────────────────────────────────────
-
-let activeChainCache: ChainCache | null = null;
-
-export function getChainCache(): ChainCache {
-  if (!activeChainCache) {
-    try {
-      activeChainCache = redisChainCache(getRedis());
-    } catch {
-      activeChainCache = memoryChainCache();
-    }
-  }
-  return activeChainCache;
-}
-
-export function setChainCache(cache: ChainCache | null): void {
-  activeChainCache = cache;
-}
 
 export function chainCacheStats() {
   return getChainCache().stats();
@@ -307,10 +291,10 @@ async function write<T>(
   } catch (err) {
     // A refused write never reached the chain; it is not a chain failure.
     if (!(err instanceof AgentPausedError) && (err as { name?: string } | null)?.name !== 'TradeBoundError') {
-      await recordChainWriteOutcome(scope, false, err instanceof ChainError ? err.contractError : null);
+      const errDetail = err instanceof Error ? `${err.message} ${String((err as { details?: unknown }).details ?? '')}` : String(err);
+      await recordChainWriteOutcome(scope, false, err instanceof ChainError ? err.contractError : null, errDetail);
     }
-    throw err;
-  }
+  });
 }
 
 type WriteContract = 'treasury' | 'reasoningRegistry' | 'resolver';
@@ -327,36 +311,37 @@ async function submitWrite<T>(
   signal?: AbortSignal,
   ref?: WriteRef,
 ): Promise<WriteResult<T>> {
-  const oracle = getFeeOracle();
-  const policy = oracle.getPolicies()[opClass];
-  const inclusionFee = await oracle.pickInclusionFee(opClass);
-  const timeoutInSeconds = timeoutFor(opClass);
+  return withCallerClass('critical', async () => {
+    const oracle = getFeeOracle();
+    const policy = oracle.getPolicies()[opClass];
+    const inclusionFee = await oracle.pickInclusionFee(opClass);
+    const timeoutInSeconds = timeoutFor(opClass);
 
-  let leasedChannel: LeasedChannel | null = null;
-  let signer: Signer | undefined = undefined;
+    let leasedChannel: LeasedChannel | null = null;
+    let signer: Signer | undefined = undefined;
 
-  if (config.CHAIN_EXECUTION_MODE === 'live') {
-    const pool = getChannelPool();
-    if (pool.size > 0) {
-      leasedChannel = await pool.acquire();
-      const agentKeypair = Keypair.fromSecret(config.AGENT_SECRET_KEY);
-      signer = channelSigner(leasedChannel.channel.keypair, agentKeypair);
+    if (config.CHAIN_EXECUTION_MODE === 'live') {
+      const pool = getChannelPool();
+      if (pool.size > 0) {
+        leasedChannel = await pool.acquire();
+        const agentKeypair = Keypair.fromSecret(config.AGENT_SECRET_KEY);
+        signer = channelSigner(leasedChannel.channel.keypair, agentKeypair);
+      }
     }
-  }
 
-  try {
-    let tx: AssembledTransaction<unknown>;
     try {
-      tx = await call({ fee: inclusionFee, timeoutInSeconds }, signer);
-    } catch (err) {
-      // A bounded trade's local limit/deadline check (#245) refused to build:
-      // nothing was sent, and the caller needs the original decision code.
-      if ((err as { name?: string } | null)?.name === 'TradeBoundError') throw err;
-      throw new ChainError(`${method} could not be built`, contractErrorName(contract, err), {
-        method,
-        cause: err instanceof Error ? err.message : String(err),
-      });
-    }
+      let tx: AssembledTransaction<unknown>;
+      try {
+        tx = await withTimeout('rpc-read', () => call({ fee: inclusionFee, timeoutInSeconds }, signer), { signal });
+      } catch (err) {
+        // A bounded trade's local limit/deadline check (#245) refused to build:
+        // nothing was sent, and the caller needs the original decision code.
+        if ((err as { name?: string } | null)?.name === 'TradeBoundError') throw err;
+        throw new ChainError(`${method} could not be built`, contractErrorName(contract, err), {
+          method,
+          cause: err instanceof Error ? err.message : String(err),
+        });
+      }
     const simulated = simulatedValue<T>(contract, method, tx);
 
     // A pause that landed while the transaction was being built stops here.
@@ -427,7 +412,7 @@ async function submitWrite<T>(
 
       // Re-simulate after signing auth entries (#37)
       if (typeof (tx as any).simulate === 'function') {
-        await (tx as any).simulate();
+        await withTimeout('rpc-read', () => (tx as any).simulate(), { signal });
       }
     }
 
@@ -459,6 +444,7 @@ async function submitWrite<T>(
   const store = prismaOutboxStore();
   let outboxRow: ChainTransactionRow = await store.create({
     kind: ref?.kind ?? `${contract}.${method}`,
+    opClass,
     refId: ref?.refId ?? null,
     contract,
     method,
@@ -495,6 +481,10 @@ async function submitWrite<T>(
     if (signedRow) outboxRow = signedRow;
   }
 
+  // Register a write intent so concurrent cached readers bypass the cache
+  // while this write is in flight (#330).
+  await beginWriteIntentForRow(outboxRow.id, method, args);
+
   const sender = getTransactionSender();
   const reader = getTransactionReader();
 
@@ -519,6 +509,7 @@ async function submitWrite<T>(
         'CHAIN_SUBMISSION_TIMEOUT',
       );
     }
+    await endWriteIntentForRow(outboxRow.id);
     throw new ChainError(`${method} submission failed`, contractErrorName(contract, err), {
       method,
       cause: err instanceof Error ? err.message : String(err),
@@ -575,6 +566,7 @@ async function submitWrite<T>(
       await leasedChannel.release();
     }
   }
+  });
 }
 
 /** Retry loop for live writes (#40): only provably-not-applied failures retry. */
@@ -589,40 +581,42 @@ async function liveWriteWithRetry<T>(
   signal?: AbortSignal,
   ref?: WriteRef,
 ): Promise<WriteResult<T>> {
-  const opts = retryOptions();
-  const startedAt = Date.now();
-  let attempt = 0;
-  for (;;) {
-    try {
-      return await attemptWrite<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref);
-    } catch (err) {
-      if (err instanceof AgentPausedError) throw err;
-      if ((err as { name?: string } | null)?.name === 'TradeBoundError') throw err;
-      // Expiry has its own recovery (#42) and a pending submission belongs to
-      // the outbox worker (#35): neither is retried blindly here.
-      if (err instanceof ExpiredError) throw err;
-      if (err instanceof ChainPendingError) throw err;
-      const failure: ClassifiedFailure =
-        err instanceof ChainWriteFailure ? err.failure : classifyFailure({ contract, err });
-      const { retry, delayMs } = retryDecision(failure, attempt, opts, Date.now() - startedAt);
-      if (!retry) {
-        throw new TransactionError(`${method} failed (${failure.class})`, failure, attempt + 1);
+  return withCallerClass('critical', async () => {
+    const opts = retryOptions();
+    const startedAt = Date.now();
+    let attempt = 0;
+    for (;;) {
+      try {
+        return await attemptWrite<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref);
+      } catch (err) {
+        if (err instanceof AgentPausedError) throw err;
+        if ((err as { name?: string } | null)?.name === 'TradeBoundError') throw err;
+        // Expiry has its own recovery (#42) and a pending submission belongs to
+        // the outbox worker (#35): neither is retried blindly here.
+        if (err instanceof ExpiredError) throw err;
+        if (err instanceof ChainPendingError) throw err;
+        const failure: ClassifiedFailure =
+          err instanceof ChainWriteFailure ? err.failure : classifyFailure({ contract, err });
+        const { retry, delayMs } = retryDecision(failure, attempt, opts, Date.now() - startedAt);
+        if (!retry) {
+          throw new TransactionError(`${method} failed (${failure.class})`, failure, attempt + 1);
+        }
+        logger.warn(
+          {
+            method,
+            failureClass: failure.class,
+            txCode: failure.txCode,
+            opCode: failure.opCode,
+            attempt: attempt + 1,
+            delayMs,
+          },
+          'chain write retrying',
+        );
+        await sleep(delayMs, signal);
+        attempt++;
       }
-      logger.warn(
-        {
-          method,
-          failureClass: failure.class,
-          txCode: failure.txCode,
-          opCode: failure.opCode,
-          attempt: attempt + 1,
-          delayMs,
-        },
-        'chain write retrying',
-      );
-      await sleep(delayMs, signal);
-      attempt++;
     }
-  }
+  });
 }
 
 async function attemptWrite<T>(
@@ -655,7 +649,7 @@ async function attemptWrite<T>(
       async (ctx) => {
         let tx: AssembledTransaction<unknown>;
         try {
-          tx = await call({ fee: inclusionFee, timeoutInSeconds });
+          tx = await withTimeout('rpc-read', () => call({ fee: inclusionFee, timeoutInSeconds }), { signal });
         } catch (err) {
           throw new ChainError(`${method} could not be built`, contractErrorName(contract, err), {
             method,
@@ -679,6 +673,7 @@ async function attemptWrite<T>(
         // #35: the write exists in the outbox before anything irreversible happens.
         outboxRow = await store.create({
           kind: ref?.kind ?? `${contract}.${method}`,
+          opClass,
           refId: ref?.refId ?? null,
           contract,
           method,
@@ -723,6 +718,10 @@ async function attemptWrite<T>(
         });
         if (signedRow) outboxRow = signedRow;
         await crashPoint('after-signed');
+
+        // Register a write intent so concurrent cached readers bypass the cache
+        // while this write is in flight (#330).
+        await beginWriteIntentForRow(outboxRow.id, method, args);
 
         const sender = getTransactionSender();
         try {
@@ -825,6 +824,7 @@ async function attemptWrite<T>(
           handledAt: new Date(),
         })
         .catch(() => undefined);
+      await endWriteIntentForRow((outboxRow as ChainTransactionRow).id);
     }
     throw err;
   }
@@ -855,6 +855,7 @@ async function acceptSend(
         handledAt: new Date(),
       })
       .catch(() => undefined);
+    await endWriteIntentForRow(row.id);
     throw new ChainWriteFailure(
       { ...failure, txHash: failure.txHash ?? txHash },
       new Error(`sendTransaction returned ERROR (${failure.txCode ?? failure.class})`),
@@ -957,7 +958,7 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
 
     let txStatusRes: any;
     try {
-      txStatusRes = await reader.getTransaction(finalHash);
+      txStatusRes = await withTimeout('rpc-confirm', () => reader.getTransaction(finalHash), { signal: c.signal });
     } catch (err: any) {
       logger.warn({ err: err?.message, txHash: finalHash }, 'getTransaction poll error; retrying');
     }
@@ -989,6 +990,7 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
             handledAt: new Date(),
           })
           .catch(() => undefined);
+        await endWriteIntentForRow(outboxRow.id);
         throw new ExpiredError(`Transaction ${finalHash} expired without inclusion`, attemptId, finalHash);
       }
 
@@ -1021,38 +1023,37 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
   if (decision === 'FAILED') {
     await submissionRecord('FAILED');
     const errName = contractErrorName(contract, confirmedTx);
+    const failedLedger = (confirmedTx as any)?.ledger ?? null;
     // The live caller's error path stands in for the completion handler.
-    await store
+    const failedRow = await store
       .transition(outboxRow.id, ['SUBMITTED'], 'FAILED', {
         landedHash: finalHash,
-        ledger: (confirmedTx as any)?.ledger ?? null,
+        ledger: failedLedger,
         error: errName ?? 'failed on-chain',
         handledAt: new Date(),
       })
-      .catch(() => undefined);
+      .catch(() => null);
+    await onConfirmed(failedRow ?? { ...outboxRow, landedHash: finalHash, ledger: failedLedger }, {
+      status: 'FAILED',
+      txHash: finalHash,
+      ledger: failedLedger,
+      error: errName ?? 'failed on-chain',
+    });
     throw new ChainError(`${method} failed on-chain: ${errName ?? 'Unknown error'}`, errName, { method, txHash: finalHash });
   }
 
   await submissionRecord('LANDED');
 
-  const feeChargedRaw = (confirmedTx as any)?.feeCharged ?? (sendRes as any)?.feeCharged;
-  const feeCharged = feeChargedRaw !== undefined ? BigInt(feeChargedRaw) : c.expectedTotal;
+  const receipt = await recordFeeReceipt(
+    outboxRow,
+    opClass,
+    { inclusionFee: c.inclusionFee, resourceFee: c.minResourceFee, totalFee: c.expectedTotal },
+    confirmedTx,
+    { landedHash: finalHash },
+  );
+  const feeCharged = receipt ? receipt.feeCharged : c.expectedTotal;
   const liveFeeDetails: FeeDetails = { ...c.feeDetails, feeCharged };
-
-  await prisma.chainFee
-    .upsert({
-      where: { txHash: finalHash },
-      create: {
-        txHash: finalHash,
-        opClass,
-        inclusionFee: c.inclusionFee,
-        resourceFee: c.minResourceFee,
-        totalFee: c.expectedTotal,
-        feeCharged,
-      },
-      update: { feeCharged },
-    })
-    .catch((err: any) => logger.warn({ err: err?.message, txHash: finalHash }, 'Failed to record chain fee'));
+  const resultXdrB64 = serializeResultXdr(confirmedTx);
 
   // The on-chain return value decoded with the binding's spec is the source
   // of truth; the simulation result is the fallback (#35).
@@ -1312,6 +1313,261 @@ export const treasuryAvailableCapitalCached = async (
   );
 };
 
+// ─── Treasury NAV & Capital Breakdown Reads (#299) ──────────────────────────
+
+export interface CapitalBreakdown {
+  liquid: bigint;
+  yield_principal: bigint;
+  yield_value: bigint;
+}
+
+export interface YieldVenueConfig {
+  venue: string;
+  enabled: boolean;
+}
+
+const ZERO_SOURCE_ACCOUNT = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+
+async function simulateViewWithLedger<T>(
+  contract: ContractKey | 'usdc',
+  contractId: string,
+  method: string,
+  args: xdr.ScVal[] = [],
+  signal?: AbortSignal,
+): Promise<{ value: T; ledger: number }> {
+  return withTimeout(
+    'rpc-read',
+    async () => {
+      const source = new Account(ZERO_SOURCE_ACCOUNT, '0');
+      const op = new Contract(contractId).call(method, ...args);
+      const tx = new TransactionBuilder(source, {
+        fee: '100',
+        networkPassphrase: config.STELLAR_NETWORK_PASSPHRASE,
+      })
+        .addOperation(op)
+        .setTimeout(0)
+        .build();
+      let sim: rpc.Api.SimulateTransactionResponse;
+      try {
+        sim = (await rpcServer.simulateTransaction(tx)) as rpc.Api.SimulateTransactionResponse;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/archived|restore/i.test(msg)) {
+          throw new ArchivedEntryError(`Simulation failed due to archived state: ${msg}`, { method });
+        }
+        throw new ChainError(`${method} read failed`, contract === 'usdc' ? null : contractErrorName(contract, err), {
+          method,
+          cause: msg,
+        });
+      }
+      const hostError = 'error' in sim && typeof sim.error === 'string' ? sim.error : undefined;
+      if (hostError) {
+        if (/archived|restore/i.test(hostError)) {
+          throw new ArchivedEntryError(`Simulation failed due to archived state: ${hostError}`, { method });
+        }
+        throw new ChainError(
+          `${method} simulation failed`,
+          contract === 'usdc' ? null : contractErrorName(contract, hostError, hostError),
+          { method, cause: hostError },
+        );
+      }
+      const retval = (sim as { result?: { retval?: xdr.ScVal } }).result?.retval;
+      const value = retval !== undefined ? (scValToNative(retval) as T) : (undefined as T);
+      const ledger = typeof sim.latestLedger === 'number' ? sim.latestLedger : 0;
+      return { value, ledger };
+    },
+    { signal },
+  );
+}
+
+async function readTreasuryOptionalView<T>(
+  method: string,
+  bindingArgs: unknown,
+  scValArgs: xdr.ScVal[],
+  signal?: AbortSignal,
+): Promise<{ value: T; ledger: number }> {
+  const client = readClients.treasury() as unknown as Record<
+    string,
+    ((...a: unknown[]) => Promise<AssembledTransaction<unknown>>) | undefined
+  >;
+  const fn = client[method];
+  if (typeof fn === 'function') {
+    return readWithLedger<T>(
+      'treasury',
+      method,
+      () => (bindingArgs !== undefined ? fn.call(client, bindingArgs) : fn.call(client)),
+      signal,
+    );
+  }
+  return simulateViewWithLedger<T>('treasury', CONTRACTS.treasury, method, scValArgs, signal);
+}
+
+function serialiseTreasuryInstanceKey(key: xdr.ScVal): string | null {
+  try {
+    const native = scValToNative(key);
+    if (typeof native === 'string') return native;
+    if (Array.isArray(native) && typeof native[0] === 'string') return native[0];
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function readTreasuryInstanceStorage(
+  signal?: AbortSignal,
+): Promise<{ entries: Map<string, unknown>; ledger: number }> {
+  return withTimeout(
+    'rpc-read',
+    async () => {
+      const map = new Map<string, unknown>();
+      const key = (xdr.LedgerKey.contractData as any)({
+        contract: new Contract(CONTRACTS.treasury).address(),
+        key: xdr.ScVal.scvLedgerKeyContractInstance(),
+        durability: xdr.ContractDataDurability.persistent(),
+      });
+      const res = await rpcServer.getLedgerEntries(key);
+      const ledger = typeof res.latestLedger === 'number' ? res.latestLedger : 0;
+      const entry = res.entries?.[0];
+      const storage = entry?.val.contractData().val().instance().storage();
+      if (storage) {
+        for (const item of storage) {
+          const name = serialiseTreasuryInstanceKey(item.key());
+          if (name) map.set(name, scValToNative(item.val()));
+        }
+      }
+      return { entries: map, ledger };
+    },
+    { signal },
+  );
+}
+
+const treasuryNavImpl = async (signal?: AbortSignal): Promise<{ value: bigint; ledger: number }> => {
+  const res = await readTreasuryOptionalView<bigint>('nav', undefined, [], signal);
+  return { value: BigInt(res.value), ledger: res.ledger };
+};
+
+const treasuryCapitalBreakdownImpl = async (
+  signal?: AbortSignal,
+): Promise<{ value: CapitalBreakdown; ledger: number }> => {
+  const res = await readTreasuryOptionalView<unknown>('capital_breakdown', undefined, [], signal);
+  const raw = res.value as Record<string, unknown> | unknown[];
+  if (Array.isArray(raw) && raw.length >= 3) {
+    return {
+      value: {
+        liquid: BigInt(raw[0] as string | number | bigint),
+        yield_principal: BigInt(raw[1] as string | number | bigint),
+        yield_value: BigInt(raw[2] as string | number | bigint),
+      },
+      ledger: res.ledger,
+    };
+  }
+  if (!raw || typeof raw !== 'object') {
+    throw new ChainError('capital_breakdown returned unexpected shape', null, { method: 'capital_breakdown' });
+  }
+  const obj = raw as Record<string, unknown>;
+  if (obj.liquid === undefined || obj.yield_principal === undefined || obj.yield_value === undefined) {
+    throw new ChainError('capital_breakdown missing required fields', null, { method: 'capital_breakdown' });
+  }
+  return {
+    value: {
+      liquid: BigInt(obj.liquid as string | number | bigint),
+      yield_principal: BigInt(obj.yield_principal as string | number | bigint),
+      yield_value: BigInt(obj.yield_value as string | number | bigint),
+    },
+    ledger: res.ledger,
+  };
+};
+
+const treasuryLiquidCapitalImpl = async (signal?: AbortSignal): Promise<{ value: bigint; ledger: number }> => {
+  const res = await readTreasuryOptionalView<bigint>('liquid_capital', undefined, [], signal);
+  return { value: BigInt(res.value), ledger: res.ledger };
+};
+
+const treasuryDailyHeadroomImpl = async (signal?: AbortSignal): Promise<{ value: bigint; ledger: number }> => {
+  const res = await readTreasuryOptionalView<bigint>('daily_headroom', undefined, [], signal);
+  return { value: BigInt(res.value), ledger: res.ledger };
+};
+
+const treasuryNetExposureImpl = async (signal?: AbortSignal): Promise<{ value: bigint; ledger: number }> => {
+  const res = await readTreasuryOptionalView<bigint>('net_exposure', undefined, [], signal);
+  return { value: BigInt(res.value), ledger: res.ledger };
+};
+
+const treasuryQueueReservedImpl = async (signal?: AbortSignal): Promise<{ value: bigint; ledger: number }> => {
+  const res = await readTreasuryOptionalView<bigint>('queue_reserved', undefined, [], signal);
+  return { value: BigInt(res.value), ledger: res.ledger };
+};
+
+const treasuryYieldVenueImpl = async (
+  signal?: AbortSignal,
+): Promise<{ value: YieldVenueConfig | null; ledger: number }> => {
+  const { entries, ledger } = await readTreasuryInstanceStorage(signal);
+  const raw = entries.get('YieldVenue');
+  if (raw === undefined || raw === null) {
+    return { value: null, ledger };
+  }
+  if (typeof raw === 'string') {
+    return { value: { venue: raw, enabled: true }, ledger };
+  }
+  if (typeof raw === 'object') {
+    const obj = raw as Record<string, unknown>;
+    const venue = String(obj.venue ?? obj.pool ?? obj.contract ?? obj.address ?? '');
+    const enabled = obj.enabled !== undefined ? Boolean(obj.enabled) : Boolean(venue);
+    return { value: venue ? { venue, enabled } : null, ledger };
+  }
+  return { value: null, ledger };
+};
+
+const treasuryMarketValuationImpl = async (
+  marketId: bigint,
+  signal?: AbortSignal,
+): Promise<{ value: bigint; ledger: number }> => {
+  const res = await readTreasuryOptionalView<bigint>(
+    'market_valuation',
+    { market_id: marketId },
+    [xdr.ScVal.scvU64(xdr.Uint64.fromString(marketId.toString()))],
+    signal,
+  );
+  return { value: BigInt(res.value), ledger: res.ledger };
+};
+
+const treasuryOpenMarketsImpl = async (
+  signal?: AbortSignal,
+): Promise<{ value: bigint[] | null; ledger: number }> => {
+  try {
+    const res = await readTreasuryOptionalView<unknown>('open_markets', undefined, [], signal);
+    if (Array.isArray(res.value)) {
+      return { value: res.value.map((id) => BigInt(id as string | number | bigint)), ledger: res.ledger };
+    }
+  } catch {
+    // Fall back to reading the OpenMarkets instance-storage key directly.
+  }
+  try {
+    const { entries, ledger } = await readTreasuryInstanceStorage(signal);
+    const raw = entries.get('OpenMarkets') ?? entries.get('OpenMarketIndex');
+    if (Array.isArray(raw)) {
+      return { value: raw.map((id) => BigInt(id as string | number | bigint)), ledger };
+    }
+    return { value: null, ledger };
+  } catch {
+    return { value: null, ledger: 0 };
+  }
+};
+
+const usdcBalanceImpl = async (
+  holder: string,
+  signal?: AbortSignal,
+): Promise<{ value: bigint; ledger: number }> => {
+  const res = await simulateViewWithLedger<bigint>(
+    'usdc',
+    CONTRACTS.usdc,
+    'balance',
+    [new Address(holder).toScVal()],
+    signal,
+  );
+  return { value: BigInt(res.value), ledger: res.ledger };
+};
+
 const treasuryRiskConfigImpl = (signal?: AbortSignal) =>
   read<RiskConfig>('treasury', 'get_config', async () => readClients.treasury().get_config(), signal);
 
@@ -1358,8 +1614,12 @@ const agentBuyImpl = (
   ref?: WriteRef,
 ) => {
   const resolver = typeof args === 'function' ? args : async () => args;
-  return write<bigint>('TRADER', 'trade', 'treasury', 'agent_buy', { ...(typeof args === 'function' ? {} : args), ...meta }, async (opts, signer) =>
-    agentClients.treasury(signer).agent_buy(await resolver(), opts as any), signal, ref);
+  const trackedArgs: Record<string, unknown> = { ...(typeof args === 'function' ? {} : args), ...meta };
+  return write<bigint>('TRADER', 'trade', 'treasury', 'agent_buy', trackedArgs, async (opts, signer) => {
+    const resolved = await resolver();
+    if (trackedArgs.market_id === undefined) trackedArgs.market_id = resolved.market_id;
+    return agentClients.treasury(signer).agent_buy(resolved, opts as any);
+  }, signal, ref);
 };
 
 const agentSellImpl = (
@@ -1438,6 +1698,16 @@ const IMPLS = {
   treasuryAvailableCapital: treasuryAvailableCapitalImpl,
   treasuryRiskConfig: treasuryRiskConfigImpl,
   treasuryDailyUsage: treasuryDailyUsageImpl,
+  treasuryNav: treasuryNavImpl,
+  treasuryCapitalBreakdown: treasuryCapitalBreakdownImpl,
+  treasuryLiquidCapital: treasuryLiquidCapitalImpl,
+  treasuryDailyHeadroom: treasuryDailyHeadroomImpl,
+  treasuryNetExposure: treasuryNetExposureImpl,
+  treasuryQueueReserved: treasuryQueueReservedImpl,
+  treasuryYieldVenue: treasuryYieldVenueImpl,
+  treasuryMarketValuation: treasuryMarketValuationImpl,
+  treasuryOpenMarkets: treasuryOpenMarketsImpl,
+  usdcBalance: usdcBalanceImpl,
   agentCreateMarket: agentCreateMarketImpl,
   agentBuy: agentBuyImpl,
   agentSell: agentSellImpl,
@@ -1475,6 +1745,16 @@ export const getBreakerState = overridable('getBreakerState');
 export const treasuryAvailableCapital = overridable('treasuryAvailableCapital');
 export const treasuryRiskConfig = overridable('treasuryRiskConfig');
 export const treasuryDailyUsage = overridable('treasuryDailyUsage');
+export const treasuryNav = overridable('treasuryNav');
+export const treasuryCapitalBreakdown = overridable('treasuryCapitalBreakdown');
+export const treasuryLiquidCapital = overridable('treasuryLiquidCapital');
+export const treasuryDailyHeadroom = overridable('treasuryDailyHeadroom');
+export const treasuryNetExposure = overridable('treasuryNetExposure');
+export const treasuryQueueReserved = overridable('treasuryQueueReserved');
+export const treasuryYieldVenue = overridable('treasuryYieldVenue');
+export const treasuryMarketValuation = overridable('treasuryMarketValuation');
+export const treasuryOpenMarkets = overridable('treasuryOpenMarkets');
+export const usdcBalance = overridable('usdcBalance');
 export const agentCreateMarket = overridable('agentCreateMarket');
 export const agentBuy = overridable('agentBuy');
 export const agentSell = overridable('agentSell');
