@@ -12,7 +12,7 @@ import { config } from '../config';
 import { ForecastSession, forecastMarket, rankForForecast, type ForecastMarket } from '../services/forecast.service';
 import { exitPosition } from '../services/exit.service';
 import { latestReserves, markOpenPositions, type MarketReserves } from '../services/valuation.service';
-import { getOnChainMarketCached } from '../services/chain.service';
+import { getOnChainMarketCached, Outcomes, wouldTripBreaker } from '../services/chain.service';
 import { indexerLag, latestLedgerView, type IndexerLag } from '../services/chain-freshness.service';
 import type { PoolState } from '../services/impact-kelly';
 import { checkCorrelation } from '../services/correlation.service';
@@ -172,6 +172,8 @@ export interface TraderEnv {
   price(m: MarketView): Promise<DecisionPrice>;
   /** Ledger-tagged FPMM reserves and the market's own fee_bps for sizing (#225); null when the market has none. */
   pool(marketId: string): Promise<PoolView | null>;
+  /** Pre-checks market-core circuit breakers before sizing/submitting a buy (#292). */
+  wouldTrip?(marketId: string, direction: TradeDirection, collateralInRaw: bigint): Promise<boolean>;
 }
 
 /** Chain reads behind the production pool(); injectable for tests. */
@@ -424,6 +426,19 @@ export function prodTraderEnv(): TraderEnv {
       const row = await prisma.market.findUnique({ where: { id: marketId }, select: { onChainMarketId: true } });
       if (row?.onChainMarketId == null) return null;
       return poolFromChain(BigInt(row.onChainMarketId));
+    },
+
+    async wouldTrip(marketId, direction, collateralInRaw) {
+      const row = await prisma.market.findUnique({ where: { id: marketId }, select: { onChainMarketId: true } });
+      if (row?.onChainMarketId == null) return false;
+      const outcome = direction === 'YES' ? Outcomes.Yes : Outcomes.No;
+      try {
+        return await wouldTripBreaker(BigInt(row.onChainMarketId), outcome, collateralInRaw);
+      } catch {
+        // Pre-breaker markets (NotSupported) or transient read failures fail open;
+        // the on-chain check_breakers guard remains authoritative.
+        return false;
+      }
     },
   };
 }

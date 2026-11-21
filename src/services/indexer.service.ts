@@ -42,6 +42,8 @@ export interface PublishMeta {
   ledger: number;
   /** On-chain market id (decimal string) when the event belongs to a market. */
   marketKey: string | null;
+  /** Within SOCKET_LIVE_LEDGER_LAG of the RPC tip; older events are catch-up (#291). */
+  live?: boolean;
 }
 
 export type PublishFn = (event: string, payload: unknown, meta: PublishMeta) => unknown;
@@ -345,6 +347,15 @@ export async function publicEventFor(event: DecodedEvent): Promise<PublicEvent |
 
 const PUBLISH_BATCH = 200;
 
+/** Latest ledger the RPC reported on the most recent successful poll. */
+let rpcLatestLedger: number | null = null;
+
+/** True when a row is close enough to the RPC tip to be a live event. */
+export function isLiveLedger(ledger: number, latestLedger: number | null): boolean {
+  if (latestLedger === null) return true;
+  return ledger >= latestLedger - config.SOCKET_LIVE_LEDGER_LAG;
+}
+
 // The live path and the recovery loop both go through this queue, so they can
 // never publish concurrently and (ledger, id) order holds within one instance.
 let publishQueue: Promise<unknown> = Promise.resolve();
@@ -372,7 +383,15 @@ export function publishPending(emit: PublishFn): Promise<{ published: number; fa
         try {
           const decoded = decodedFromStored(row);
           const pub = await publicEventFor(decoded);
-          if (pub) await emit(pub.type, pub.payload, { id: row.id, ledger: row.ledger, marketKey: pub.marketKey });
+          if (pub) {
+            const latest = rpcLatestLedger ?? pollState.lastLedger;
+            await emit(pub.type, pub.payload, {
+              id: row.id,
+              ledger: row.ledger,
+              marketKey: pub.marketKey,
+              live: isLiveLedger(row.ledger, latest),
+            });
+          }
           await prisma.chainEvent.update({ where: { id: row.id }, data: { published: true } });
           published++;
         } catch (err) {
@@ -415,6 +434,7 @@ export async function backfillEvents(
 
   try {
     const health = await withTimeout('rpc-events', async () => deps.source.getHealth(), { signal: handle.signal });
+    rpcLatestLedger = health.latestLedger;
     const cursor = await readCursor();
     let startLedger = fromLedger ?? (cursor !== null ? cursor + 1 : health.oldestLedger);
 

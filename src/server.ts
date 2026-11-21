@@ -1,7 +1,6 @@
 import http from 'http';
 import { Server } from 'socket.io';
 import { Keypair } from '@stellar/stellar-sdk';
-import { createAdapter } from '@socket.io/redis-streams-adapter';
 import app from './app';
 import { config } from './config';
 import { initSecrets, startSecretRefresh } from './config/secrets';
@@ -40,6 +39,7 @@ import {
   recordSocketRejection,
 } from './lib/socket-limits';
 import { SocketThrottle, attachSlowConsumerGuard } from './lib/socket-throttle';
+import { createSocketStreamAdapter, startSocketStreamMonitor, type SocketStreamMonitor } from './lib/socket-stream';
 import { planForRole, startProbeServer } from './lib/process-role';
 
 let stopEventListener: (() => void) | null = null;
@@ -47,6 +47,8 @@ let stopFanout: (() => Promise<void>) | null = null;
 let stopSecretRefresh: (() => void) | null = null;
 let throttle: SocketThrottle | null = null;
 let stopSlowGuard: (() => void) | null = null;
+let stopStreamMonitor: (() => void) | null = null;
+let closeStreamAdapter: (() => Promise<void>) | null = null;
 let stopOutboxWorker: (() => void) | null = null;
 let stopOpsAlerts: (() => void) | null = null;
 
@@ -229,8 +231,21 @@ async function bootstrap(): Promise<void> {
     io.use(socketAuthMiddleware());
     attachSessionLifecycle(io);
     setRealtime(io);
+    const activeIo = io;
+    let streamMonitor: SocketStreamMonitor | undefined;
     if (config.EVENT_BUS_ENABLED) {
-      io.adapter(createAdapter(getRedis(), { streamName: 'oracledesk:socket.io', blockTimeInMs: 1000 }));
+      const streamAdapter = createSocketStreamAdapter();
+      streamMonitor = streamAdapter.monitor;
+      closeStreamAdapter = streamAdapter.close;
+      io.adapter(streamAdapter.adapter);
+      stopStreamMonitor = startSocketStreamMonitor(streamAdapter.monitor, {
+        onResync: (snapshot) => {
+          activeIo.emit('RESYNC_REQUIRED', {
+            reason: 'STREAM_GAP',
+            offset: snapshot.offset,
+          });
+        },
+      });
     } else {
       logger.warn('EVENT_BUS_ENABLED=false: in-process event bus; socket events reach this instance only');
     }
@@ -243,8 +258,7 @@ async function bootstrap(): Promise<void> {
     });
     stopSlowGuard = slowGuard.stop;
 
-    // Socket throttle (Issue #96)
-    const activeIo = io;
+    // Socket throttle (Issue #96, #291)
     throttle = new SocketThrottle(
       {
         emit: (event, payload, opts) => {
@@ -266,7 +280,9 @@ async function bootstrap(): Promise<void> {
     );
 
     if (rolePlan.startFanout) {
-      stopFanout = config.EVENT_BUS_ENABLED ? startFanout(bus, io) : startLocalFanout(bus, io);
+      stopFanout = config.EVENT_BUS_ENABLED
+        ? startFanout(bus, io, { throttle, monitor: streamMonitor })
+        : startLocalFanout(bus, io, { throttle, monitor: streamMonitor });
     }
 
     // Make io accessible via app
@@ -338,7 +354,9 @@ async function bootstrap(): Promise<void> {
   onShutdown('stop-producers', 'fanout', async () => { if (stopFanout) await stopFanout(); }, 5_000);
   onShutdown('stop-producers', 'secret-refresh', async () => { stopSecretRefresh?.(); }, 1_000);
   onShutdown('stop-producers', 'ops-alerts', async () => { stopOpsAlerts?.(); }, 1_000);
+  onShutdown('stop-producers', 'socket-stream-monitor', async () => { stopStreamMonitor?.(); }, 1_000);
   onShutdown('release-leases', 'redis-waiters', async () => { await releaseAllWaiters(); }, 2_000);
+  onShutdown('close-transports', 'socket-stream-adapter', async () => { if (closeStreamAdapter) await closeStreamAdapter(); }, 2_000);
   onShutdown('close-transports', 'prisma', async () => { await prisma.$disconnect(); }, 5_000);
   onShutdown('close-transports', 'redis', async () => { await closeRedis(); }, 3_000);
 
