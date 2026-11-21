@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { requireAuth, requirePermission, requireStepUp } from '../middlewares/auth.middleware';
 import {
   ackDispute,
+  ackSpecCompat,
   addOperationSignature,
   cancelDisputeTx,
   cancelTreasuryOperation,
@@ -21,6 +22,7 @@ import {
   retireChainSigningKey,
   getSystemStatus,
   getChainFeesReport,
+  getExecutionQuality,
   pauseAgentControl,
   postGrantAdmin,
   postRevokeAdmin,
@@ -31,6 +33,7 @@ import {
   getOperationSep7Status,
   issueOperationSep7,
   getDisputes,
+  getPriceMarketsHealth,
   listReconciliationRuns,
   listTreasuryOperations,
   recordTreasuryOperation,
@@ -72,7 +75,9 @@ router.get('/agent-decisions/cycles/:cycleId', requirePermission('admin.read'), 
 router.post('/agents/:agent/pause', requirePermission('agents.manage'), pauseAgentControl);
 router.post('/agents/:agent/resume', requirePermission('agents.manage'), resumeAgentControl);
 router.get('/status', requirePermission('admin.read'), getSystemStatus);
+router.get('/crons/:job/runs', requirePermission('admin.read'), getCronRuns);
 router.get('/fees', requirePermission('admin.read'), getChainFeesReport);
+router.get('/execution-quality', requirePermission('admin.read'), getExecutionQuality);
 router.get('/disputes', requirePermission('disputes.manage'), getDisputes);
 router.post('/disputes/:id/ack', requirePermission('disputes.manage'), ackDispute);
 router.post('/disputes/:id/cancel-tx', requirePermission('disputes.manage'), cancelDisputeTx);
@@ -101,6 +106,7 @@ router.post('/agents/:agent/pause', pauseAgentControl);
 router.post('/agents/:agent/resume', resumeAgentControl);
 router.get('/status', getSystemStatus);
 router.get('/fees', getChainFeesReport);
+router.get('/execution-quality', getExecutionQuality);
 router.get('/disputes', getDisputes);
 router.post('/disputes/:id/ack', ackDispute);
 router.post('/disputes/:id/cancel-tx', cancelDisputeTx);
