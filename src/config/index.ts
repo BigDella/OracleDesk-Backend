@@ -566,6 +566,7 @@ export const envObjectSchema = z
     TRUST_INBOUND_REQUEST_ID: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
     INDEXER_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
     INDEXER_POLL_MS: z.string().default('5000').transform(Number),
+    INDEXER_START_LEDGER: z.string().optional().transform((v) => (v !== undefined && v !== '' ? Number(v) : undefined)).pipe(z.number().int().positive().optional()),
 
 
     // ── Health probes (#111) ──────────────────────────────────────────────

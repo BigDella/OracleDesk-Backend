@@ -24,7 +24,7 @@ import { config } from '../config';
 import { secret } from '../config/secrets';
 import { chainWritesStatus, health } from '../services/health.service';
 import { socketStreamClusterStats } from '../lib/socket-stream';
-import { indexerStatus } from '../services/indexer.service';
+import { indexerStatus, CURSOR_ID } from '../services/indexer.service';
 import { Keypair } from '@stellar/stellar-sdk';
 import { agentSigner } from '../services/stellar/clients';
 import { acknowledgeSpecDrift, getSpecCompatHistory } from '../services/stellar/spec-monitor';
@@ -766,4 +766,103 @@ export async function getExecutionQuality(req: Request, res: Response): Promise<
     ? Math.min(365, Number(rawDays))
     : 30;
   sendSuccess(res, await getExecutionQualitySummary({ windowDays }));
+}
+
+/** GET /admin/indexer/gaps — list indexer ledger gaps (#10) */
+export async function getIndexerGaps(req: Request, res: Response): Promise<void> {
+  const { page, limit, skip } = parsePagination(req);
+  const openParam = req.query.open;
+  const where: any = { network: CURSOR_ID };
+  if (openParam === 'true') {
+    where.resolvedAt = null;
+  } else if (openParam === 'false') {
+    where.resolvedAt = { not: null };
+  }
+
+  const [gaps, total] = await Promise.all([
+    prisma.indexerGap.findMany({
+      where,
+      orderBy: [{ detectedAt: 'desc' }, { fromLedger: 'desc' }],
+      skip,
+      take: limit,
+    }),
+    prisma.indexerGap.count({ where }),
+  ]);
+
+  sendSuccess(res, gaps, 200, buildPaginationMeta(page, limit, total));
+}
+
+const resolveGapSchema = z.object({
+  resolvedBy: z.string().min(1, 'resolvedBy is required'),
+  note: z.string().optional(),
+});
+
+/** PATCH /admin/indexer/gaps/:id/resolve — mark an indexer gap resolved (#10) */
+export async function resolveIndexerGap(req: Request, res: Response): Promise<void> {
+  const id = String(req.params.id);
+  const parsed = resolveGapSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Invalid resolve body', parsed.error.flatten().fieldErrors as any);
+  }
+
+  const existing = await prisma.indexerGap.findUnique({ where: { id } });
+  if (!existing) {
+    throw new AppError(404, 'NOT_FOUND', `Indexer gap ${id} not found`);
+  }
+  if (existing.resolvedAt !== null) {
+    throw new AppError(409, 'ALREADY_RESOLVED', `Indexer gap ${id} is already resolved`);
+  }
+
+  const updated = await prisma.indexerGap.update({
+    where: { id },
+    data: {
+      resolvedAt: new Date(),
+      resolvedBy: parsed.data.resolvedBy,
+      note: parsed.data.note ?? existing.note,
+    },
+  });
+
+  sendSuccess(res, updated, 200);
+}
+
+export async function getAgentDecisions(req: Request, res: Response): Promise<void> {
+  sendSuccess(res, []);
+}
+
+export async function getAgentDecisionCycles(req: Request, res: Response): Promise<void> {
+  sendSuccess(res, []);
+}
+
+export async function getAgentDecisionCycleFunnel(req: Request, res: Response): Promise<void> {
+  sendSuccess(res, {});
+}
+
+export async function getCronRuns(req: Request, res: Response): Promise<void> {
+  sendSuccess(res, []);
+}
+
+function weightSetId(req: Request): string {
+  const id = String(req.params.id ?? '').trim();
+  if (!id || id.length > 64) throw new AppError(400, 'VALIDATION_ERROR', 'Invalid weight set id');
+  return id;
+}
+
+export async function listSourceWeightSets(_req: Request, res: Response): Promise<void> {
+  sendSuccess(res, await sourceWeights.listWeightSets());
+}
+
+export async function getSourceWeightSet(req: Request, res: Response): Promise<void> {
+  sendSuccess(res, await sourceWeights.getWeightSetWithDiff(weightSetId(req)));
+}
+
+export async function approveSourceWeightSet(req: Request, res: Response): Promise<void> {
+  sendSuccess(res, await sourceWeights.approveWeightSet(weightSetId(req), actor(req)));
+}
+
+export async function activateSourceWeightSet(req: Request, res: Response): Promise<void> {
+  sendSuccess(res, await sourceWeights.activateWeightSet(weightSetId(req), actor(req)));
+}
+
+export async function rollbackSourceWeightSet(req: Request, res: Response): Promise<void> {
+  sendSuccess(res, await sourceWeights.rollbackWeightSet(actor(req)));
 }

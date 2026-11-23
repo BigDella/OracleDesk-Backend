@@ -127,23 +127,6 @@ enum GenerationJobStatus {
   FAILED
 }
 
-enum GenerationRunState {
-  STARTED
-  SIGNALS_READY
-  PROPOSED
-  MARKET_PERSISTED
-  QUESTION_PINNED
-  CHAIN_SUBMITTED
-  CHAIN_CONFIRMED
-  TRACE_PERSISTED
-  TRACE_PINNED
-  TRACE_PUBLISHED
-  COMPLETED
-  SKIPPED
-  NEEDS_ATTENTION
-  CANCELLED
-}
-
 enum TraceAuditStatus {
   VERIFIED
   HASH_MISMATCH
@@ -256,6 +239,7 @@ model User {
   premiumUsageDaily PremiumUsageDaily[]
   allowanceDays    AllowanceDay[]
   allowanceCharges AllowanceCharge[]
+  receipts         Receipt[]
 
   @@index([walletAddress])
   @@map("users")
@@ -395,27 +379,6 @@ model MarketGenerationJob {
 
   @@index([status])
   @@map("market_generation_jobs")
-}
-
-model MarketGenerationRun {
-  id            String            @id @default(uuid())
-  trigger       String
-  state         GenerationRunState @default(STARTED)
-  attempts      Int               @default(0)
-  nextAttemptAt DateTime?
-  lockedBy      String?
-  lockedUntil   DateTime?
-  inputs        Json?
-  outputs       Json              @default("{}")
-  marketId      String?           @unique
-  lastError     Json?
-  createdAt     DateTime          @default(now())
-  updatedAt     DateTime          @updatedAt
-
-  market Market? @relation(fields: [marketId], references: [id], onDelete: SetNull)
-
-  @@index([state, nextAttemptAt])
-  @@map("market_generation_runs")
 }
 
 /// Individual trade executed by the Trader Agent
@@ -707,6 +670,12 @@ model ReasoningTrace {
   previewSources      Json?             // First 2 sources (free preview)
   lastAuditStatus     TraceAuditStatus?
   lastAuditedAt       DateTime?
+  /// Registry governance verdict (#306), separate from hash audit status.
+  verdict              TraceVerdictKind  @default(UNKNOWN)
+  verdictReason        String?           @map("verdict_reason")
+  verdictEffectiveFrom BigInt?           @map("verdict_effective_from")
+  verdictCheckedAt     DateTime?         @map("verdict_checked_at") @db.Timestamptz(3)
+  verdictVersion       Int               @default(0) @map("verdict_version")
   /// Source weight set version the evidence was scored with (#223); null = before #223 (v0).
   sourceWeightSetVersion Int?
   createdAt           DateTime          @default(now())
@@ -1905,6 +1874,8 @@ model AlertDelivery {
   reviewId  String?
   /// Operational incident (#226). Null for dispute alerts.
   incidentId String?
+  /// Dedupe subject id (reviewId for disputes, or e.g. price_feed:<marketId>:<severity>, price_verify:<marketId>).
+  subjectId String?
   /// open | escalate | resolve. Dispute rows are all `open`.
   kind      String    @default("open")
   /// INFO | WARN | CRITICAL
@@ -2288,6 +2259,21 @@ model MoneyAuditFinding {
   @@map("money_audit_findings")
 }
 
+/// Persisted indexer ledger range skipped across RPC retention windows (#10).
+model IndexerGap {
+  id          String    @id @default(uuid())
+  network     String            // CURSOR_ID value
+  fromLedger  Int
+  toLedger    Int               // inclusive
+  kind        String            // RETENTION | INITIAL
+  detectedAt  DateTime  @default(now()) @db.Timestamptz(3)
+  resolvedAt  DateTime? @db.Timestamptz(3)
+  resolvedBy  String?           // e.g. "archive-backfill", "admin:G..."
+  note        String?
+
+  @@unique([network, fromLedger, toLedger])
+  @@index([network, resolvedAt])
+  @@map("indexer_gaps")
 /// Statistical baseline per (task, provider, model, promptVersion) for canary drift detection (#296).
 model LlmCanaryBaseline {
   id            String   @id @default(uuid())

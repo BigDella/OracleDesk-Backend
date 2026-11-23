@@ -45,6 +45,16 @@ import {
   recoverChainTransaction,
   rerunChainTransactionHandler,
   abandonChainTransaction,
+  getIndexerGaps,
+  resolveIndexerGap,
+  getAgentDecisions,
+  getAgentDecisionCycles,
+  getAgentDecisionCycleFunnel,
+  getCronRuns,
+  listMoneyAuditRuns,
+  listMoneyAuditFindings,
+  triggerMoneyAuditRun,
+  ackMoneyAuditFinding,
 } from '../controllers/admin.controller';
 
 const router = Router();
@@ -170,6 +180,9 @@ router.get('/source-weights/:id', requirePermission('admin.read'), getSourceWeig
 router.post('/source-weights/:id/approve', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, approveSourceWeightSet);
 router.post('/source-weights/:id/activate', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, activateSourceWeightSet);
 
+// Indexer ledger gaps (#10)
+router.get('/indexer/gaps', requirePermission('admin.read'), getIndexerGaps);
+router.patch('/indexer/gaps/:id/resolve', requirePermission('admin.manage'), resolveIndexerGap);
 // LLM drift canary & model demotions (#296)
 router.get('/llm/canary', requirePermission('admin.read'), getLlmCanaryStatus);
 router.post('/llm/demotions', requirePermission('agents.manage'), requireStepUp, overrideLlmDemotion);
