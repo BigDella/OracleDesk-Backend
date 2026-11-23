@@ -45,6 +45,16 @@ import {
   recoverChainTransaction,
   rerunChainTransactionHandler,
   abandonChainTransaction,
+  getIndexerGaps,
+  resolveIndexerGap,
+  getAgentDecisions,
+  getAgentDecisionCycles,
+  getAgentDecisionCycleFunnel,
+  getCronRuns,
+  listMoneyAuditRuns,
+  listMoneyAuditFindings,
+  triggerMoneyAuditRun,
+  ackMoneyAuditFinding,
 } from '../controllers/admin.controller';
 
 const router = Router();
@@ -167,5 +177,9 @@ router.post('/source-weights/rollback', requirePermission('agents.weights.approv
 router.get('/source-weights/:id', requirePermission('admin.read'), getSourceWeightSet);
 router.post('/source-weights/:id/approve', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, approveSourceWeightSet);
 router.post('/source-weights/:id/activate', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, activateSourceWeightSet);
+
+// Indexer ledger gaps (#10)
+router.get('/indexer/gaps', requirePermission('admin.read'), getIndexerGaps);
+router.patch('/indexer/gaps/:id/resolve', requirePermission('admin.manage'), resolveIndexerGap);
 
 export default router;
