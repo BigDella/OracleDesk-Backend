@@ -570,6 +570,7 @@ export async function submitMarketCreation(
     if (prep.spec.kind === 'price') {
       try {
         await revealPriceSpec(result.value, prep.spec);
+        await revealPriceSpec(result.value, spec, { marketId: market.id });
         logger.info({ marketId: market.id, onChainMarketId: result.value.toString() }, 'Price spec revealed');
       } catch (err) {
         await writeAgentLog({

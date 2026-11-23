@@ -171,6 +171,8 @@ import {
   getSourceWeightSet,
   listSourceWeightSets,
   rollbackSourceWeightSet,
+  getLlmCanaryStatus,
+  overrideLlmDemotion,
 } from '../controllers/admin.controller';
 router.get('/source-weights', requirePermission('admin.read'), listSourceWeightSets);
 router.post('/source-weights/rollback', requirePermission('agents.weights.approve', { audit: false }), requireStepUp, rollbackSourceWeightSet);
@@ -181,5 +183,8 @@ router.post('/source-weights/:id/activate', requirePermission('agents.weights.ap
 // Indexer ledger gaps (#10)
 router.get('/indexer/gaps', requirePermission('admin.read'), getIndexerGaps);
 router.patch('/indexer/gaps/:id/resolve', requirePermission('admin.manage'), resolveIndexerGap);
+// LLM drift canary & model demotions (#296)
+router.get('/llm/canary', requirePermission('admin.read'), getLlmCanaryStatus);
+router.post('/llm/demotions', requirePermission('agents.manage'), requireStepUp, overrideLlmDemotion);
 
 export default router;
