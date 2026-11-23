@@ -280,19 +280,22 @@ async function write<T>(
   signal?: AbortSignal,
   ref?: WriteRef,
 ): Promise<WriteResult<T>> {
-  const seenVersion = await assertAgentActive(scope);
-  try {
-    const viaAgentAccount = config.CHAIN_EXECUTION_MODE === 'live' && getChannelPool().size === 0;
-    const result = viaAgentAccount
-      ? await liveWriteWithRetry<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref)
-      : await submitWrite<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref);
-    await recordChainWriteOutcome(scope, true, null);
-    return result;
-  } catch (err) {
-    // A refused write never reached the chain; it is not a chain failure.
-    if (!(err instanceof AgentPausedError) && (err as { name?: string } | null)?.name !== 'TradeBoundError') {
-      const errDetail = err instanceof Error ? `${err.message} ${String((err as { details?: unknown }).details ?? '')}` : String(err);
-      await recordChainWriteOutcome(scope, false, err instanceof ChainError ? err.contractError : null, errDetail);
+  return withCallerClass('critical', async () => {
+    const seenVersion = await assertAgentActive(scope);
+    try {
+      const viaAgentAccount = config.CHAIN_EXECUTION_MODE === 'live' && getChannelPool().size === 0;
+      const result = viaAgentAccount
+        ? await liveWriteWithRetry<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref)
+        : await submitWrite<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref);
+      await recordChainWriteOutcome(scope, true, null);
+      return result;
+    } catch (err) {
+      // A refused write never reached the chain; it is not a chain failure.
+      if (!(err instanceof AgentPausedError) && (err as { name?: string } | null)?.name !== 'TradeBoundError') {
+        const errDetail = err instanceof Error ? `${err.message} ${String((err as { details?: unknown }).details ?? '')}` : String(err);
+        await recordChainWriteOutcome(scope, false, err instanceof ChainError ? err.contractError : null, errDetail);
+      }
+      throw err;
     }
   });
 }
