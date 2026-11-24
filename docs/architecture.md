@@ -100,6 +100,8 @@ Stellar Soroban fees follow a two-part model:
 
 Overrides can be provided at boot via `FEE_POLICY_JSON`.
 
+Rolling fee spend budgets are disabled by default. Set `FEE_SPEND_ENFORCE=true` and configure `FEE_SPEND_BUDGETS_JSON` as an operation-class map of windows, for example `{"trade":[{"windowSeconds":3600,"budget":"25000000"}]}`. Reservations are held in the PostgreSQL fee-spend ledger while a transaction is in flight, settled with the charged fee, and released on failure or expiry. Advisory locks serialize reservations across API and worker instances; a budget trip pauses the affected agent with source `fee_budget`.
+
 **Budget Enforcement and Calibration**:
 Before any live transaction is signed, `minResourceFee` is checked against the class budget. If it exceeds the budget, execution halts immediately with `FEE_BUDGET_EXCEEDED` (carrying simulation details and no secrets). In dry-run mode, the breach is logged as a warning and simulation continues.
 To calibrate budgets for production:

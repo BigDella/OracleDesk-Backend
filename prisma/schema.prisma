@@ -1628,6 +1628,28 @@ model ChainTransaction {
   @@map("chain_transactions")
 }
 
+/// Reservation ledger for rolling fee budgets. One reservation has one row per
+/// configured window so settlement/release is idempotent across workers.
+model FeeSpendEntry {
+  id            String    @id @default(uuid())
+  reservationId String
+  opClass       String
+  windowSeconds Int
+  windowStart   DateTime  @db.Timestamptz(3)
+  windowEnd     DateTime  @db.Timestamptz(3)
+  amount        BigInt
+  status        String    @default("RESERVED")
+  settledAmount BigInt?
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime  @updatedAt @db.Timestamptz(3)
+  settledAt     DateTime?
+
+  @@unique([reservationId, windowSeconds])
+  @@index([opClass, windowStart, windowEnd, status])
+  @@index([reservationId, status])
+  @@map("fee_spend_entries")
+}
+
 /// On-chain fees recorded per transaction (#39, #308).
 model ChainFee {
   txHash               String   @id @map("tx_hash")

@@ -74,6 +74,7 @@ export { getChainCache, memoryChainCache, setChainCache };
 import { Account, Address, Contract, Keypair, TransactionBuilder, scValToNative, xdr } from '@stellar/stellar-sdk';
 import { prisma } from '../lib/prisma';
 import { getFeeOracle, type OperationClass } from './stellar/fees';
+import { FeeSpendBudgetExceeded, releaseSpend, reserveSpend, settleSpend } from './stellar/fee-spend';
 import { recordFeeReceipt, serializeResultXdr } from './stellar/fee-receipt';
 import { timeoutFor, decideExpiry, ExpiredError, type ExpiryDecision, authExpirationLedger } from './stellar/timebounds';
 import {
@@ -93,6 +94,21 @@ import {
 export { ExpiredError, ArchivedEntryError };
 
 type ContractKey = 'marketCore' | 'treasury' | 'resolver' | 'reasoningRegistry';
+
+async function reserveWriteSpend(scope: AgentScope, opClass: OperationClass, amount: bigint, reservationId: string): Promise<void> {
+  try {
+    await reserveSpend(opClass, amount, reservationId);
+  } catch (err) {
+    if (err instanceof FeeSpendBudgetExceeded) {
+      await import('./agent-controls.service').then(({ pauseAgent }) => pauseAgent(scope, {
+        source: 'fee_budget',
+        actor: 'system',
+        reason: `Rolling ${opClass} fee budget exceeded`,
+      })).catch((pauseErr) => logger.warn({ err: pauseErr, scope }, 'Could not pause agent after fee budget trip'));
+    }
+    throw err;
+  }
+}
 
 export interface FeeDetails {
   opClass: OperationClass;
@@ -460,6 +476,8 @@ async function submitWrite<T>(
     resourceFee: minResourceFee.toString(),
   });
 
+    await reserveWriteSpend(scope, opClass, expectedTotal, outboxRow.id);
+
     if (typeof (tx as any).sign === 'function') {
       await (tx as any).sign();
     }
@@ -688,6 +706,7 @@ async function attemptWrite<T>(
           innerFee: inclusionFee.toString(),
           resourceFee: minResourceFee.toString(),
         });
+        await reserveWriteSpend(scope, opClass, inclusionFee + minResourceFee, outboxRow.id);
         await crashPoint('after-built');
 
         // The binding built and simulated against the RPC's account; rewrite the
@@ -993,6 +1012,7 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
             handledAt: new Date(),
           })
           .catch(() => undefined);
+        await releaseSpend(outboxRow.id).catch((err) => logger.warn({ err, outboxId: outboxRow.id }, 'Could not release expired fee reservation'));
         await endWriteIntentForRow(outboxRow.id);
         throw new ExpiredError(`Transaction ${finalHash} expired without inclusion`, attemptId, finalHash);
       }
@@ -1042,6 +1062,7 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
       ledger: failedLedger,
       error: errName ?? 'failed on-chain',
     });
+    await releaseSpend(outboxRow.id).catch((err) => logger.warn({ err, outboxId: outboxRow.id }, 'Could not release failed fee reservation'));
     throw new ChainError(`${method} failed on-chain: ${errName ?? 'Unknown error'}`, errName, { method, txHash: finalHash });
   }
 
@@ -1055,6 +1076,7 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
     { landedHash: finalHash },
   );
   const feeCharged = receipt ? receipt.feeCharged : c.expectedTotal;
+  await settleSpend(outboxRow.id, feeCharged).catch((err) => logger.warn({ err, outboxId: outboxRow.id }, 'Could not settle fee reservation'));
   const liveFeeDetails: FeeDetails = { ...c.feeDetails, feeCharged };
   const resultXdrB64 = serializeResultXdr(confirmedTx);
 

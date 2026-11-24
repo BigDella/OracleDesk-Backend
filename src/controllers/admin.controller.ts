@@ -29,6 +29,7 @@ import { Keypair } from '@stellar/stellar-sdk';
 import { agentSigner } from '../services/stellar/clients';
 import { acknowledgeSpecDrift, getSpecCompatHistory } from '../services/stellar/spec-monitor';
 import { getFeeOracle } from '../services/stellar/fees';
+import { spendSnapshot } from '../services/stellar/fee-spend';
 import { getChainCache } from '../lib/chain-cache';
 import { getLlmUsage } from '../lib/llm-budget';
 import { getBulkheadStats } from '../lib/resilience';
@@ -620,12 +621,15 @@ export async function getChainFeesReport(_req: Request, res: Response): Promise<
   }));
 
   const estimateRowCount = Number(estimateRows[0]?.count ?? 0);
+  const spend = await Promise.all(['market_create', 'trade', 'trace_publish', 'maintenance'].map((opClass) => spendSnapshot(opClass as any)));
+  const spendReport = spend.flat().map((row) => ({ ...row, reserved: row.reserved.toString(), budget: row.budget.toString(), remaining: row.remaining.toString() }));
 
   sendSuccess(res, {
     oracle: snapshot,
     report,
     byPayer,
     estimateRowCount,
+    spend: spendReport,
   });
 }
 

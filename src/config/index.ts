@@ -436,6 +436,9 @@ export const envObjectSchema = z
 
     // ── Fee policies (#39) ───────────────────────────────────────────────
     FEE_POLICY_JSON: optionalString,
+    // Shape: { "trade": [{ "windowSeconds": 3600, "budget": "25000000" }] }.
+    FEE_SPEND_BUDGETS_JSON: optionalString,
+    FEE_SPEND_ENFORCE: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
     FEE_STATS_CACHE_MS: z.string().default('10000').transform(Number).pipe(z.number().int().positive()),
     FEE_STATS_MAX_AGE_MS: z.string().default('60000').transform(Number).pipe(z.number().int().positive()),
 
@@ -1284,6 +1287,34 @@ export const envSchema = envObjectSchema
       } catch {
         ctx.addIssue({ code: 'custom', path: ['FEE_POLICY_JSON'], message: 'must be valid JSON' });
       }
+    }
+    if (env.FEE_SPEND_BUDGETS_JSON) {
+      try {
+        const parsed = JSON.parse(env.FEE_SPEND_BUDGETS_JSON);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          ctx.addIssue({ code: 'custom', path: ['FEE_SPEND_BUDGETS_JSON'], message: 'must be a JSON object' });
+        } else {
+          const validClasses = ['market_create', 'trade', 'trace_publish', 'maintenance'];
+          for (const [opClass, value] of Object.entries(parsed)) {
+            if (!validClasses.includes(opClass)) {
+              ctx.addIssue({ code: 'custom', path: ['FEE_SPEND_BUDGETS_JSON', opClass], message: `unknown operation class: ${opClass}` });
+              continue;
+            }
+            const windows = Array.isArray(value) ? value : [value];
+            for (const window of windows) {
+              const item = window as any;
+              if (!item || typeof item !== 'object' || !/^\d+$/.test(String(item.windowSeconds ?? '')) || Number(item.windowSeconds) < 1 || !/^\d+$/.test(String(item.budget ?? ''))) {
+                ctx.addIssue({ code: 'custom', path: ['FEE_SPEND_BUDGETS_JSON', opClass], message: 'each window needs positive integer windowSeconds and non-negative integer budget' });
+              }
+            }
+          }
+        }
+      } catch {
+        ctx.addIssue({ code: 'custom', path: ['FEE_SPEND_BUDGETS_JSON'], message: 'must be valid JSON' });
+      }
+    }
+    if (env.FEE_SPEND_ENFORCE && !env.FEE_SPEND_BUDGETS_JSON) {
+      ctx.addIssue({ code: 'custom', path: ['FEE_SPEND_BUDGETS_JSON'], message: 'is required when FEE_SPEND_ENFORCE=true' });
     }
   });
 
