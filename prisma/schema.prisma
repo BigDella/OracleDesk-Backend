@@ -390,6 +390,10 @@ model Trade {
   collateralRaw Decimal?      @db.Decimal(39, 0)
   sharesRaw    Decimal?       @db.Decimal(39, 0)
   feeRaw       Decimal?       @db.Decimal(39, 0)
+  reserveYesRaw Decimal?      @db.Decimal(39, 0)
+  reserveNoRaw  Decimal?      @db.Decimal(39, 0)
+  fillLedger   Int?
+  fillMismatch Json?
   /// Decision price and edge in basis points; fill price comes from chain evidence.
   priceBps     Int?
   fillPriceBps Int?
@@ -511,6 +515,11 @@ model PositionExit {
   sharesSoldRaw    Decimal  @default(0) @db.Decimal(39, 0)
   collateralOutRaw Decimal  @db.Decimal(39, 0)
   maxSharesInRaw   Decimal  @db.Decimal(39, 0)
+  feeRaw           Decimal? @db.Decimal(39, 0)
+  reserveYesRaw    Decimal? @db.Decimal(39, 0)
+  reserveNoRaw     Decimal? @db.Decimal(39, 0)
+  fillLedger       Int?
+  fillMismatch     Json?
   /// collateralOut / sharesSold, for display.
   effectivePrice   Float?
   effectivePriceBps Int?
@@ -1508,6 +1517,28 @@ model ChainTransaction {
   @@index([kind, refId])
   @@index([feeBumpHashes], type: Gin)
   @@map("chain_transactions")
+}
+
+/// Reservation ledger for rolling fee budgets. One reservation has one row per
+/// configured window so settlement/release is idempotent across workers.
+model FeeSpendEntry {
+  id            String    @id @default(uuid())
+  reservationId String
+  opClass       String
+  windowSeconds Int
+  windowStart   DateTime  @db.Timestamptz(3)
+  windowEnd     DateTime  @db.Timestamptz(3)
+  amount        BigInt
+  status        String    @default("RESERVED")
+  settledAmount BigInt?
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime  @updatedAt @db.Timestamptz(3)
+  settledAt     DateTime?
+
+  @@unique([reservationId, windowSeconds])
+  @@index([opClass, windowStart, windowEnd, status])
+  @@index([reservationId, status])
+  @@map("fee_spend_entries")
 }
 
 /// On-chain fees recorded per transaction (#39, #308).

@@ -789,7 +789,7 @@ export async function recordPayment(params: {
     throw new AppError(409, 'PAYMENT_CLAIM_IN_PROGRESS', 'This payment is being processed; retry shortly');
   }
 
-  const { subscription, transfer, replay } = claim.value;
+  const { subscription, replay } = claim.value;
   if (replay || !transfer) return subscription;
 
   logger.info(
